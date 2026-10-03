@@ -1,0 +1,54 @@
+policy_module(swrap, 1.2.1)
+
+########################################
+# swrap on core. sshd runs the pam_exec helper (swrap-pam-unlock) in its session domain;
+# it must read the vault wraps and talk to swrapd's root-only unseal socket. Nothing else
+# in the sshd domains gets access to swrap data.
+
+require {
+    type sshd_t;
+    type sshd_session_t;
+    type unconfined_service_t;
+}
+
+########################################
+# Confinement, being prepared: swrapd (daemon, session workers, swai sandboxes) and swrap-web
+# get their own domains, PERMISSIVE for now: nothing is denied, and everything enforcement
+# would deny is logged (permissive=1). `swrap doctor --selinux` summarises those denials and
+# drafts the rules; once they are in, the `permissive` lines go and the domains are enforced.
+
+type swrapd_t;
+type swrapd_exec_t;
+init_daemon_domain(swrapd_t, swrapd_exec_t)
+permissive swrapd_t;
+
+type swrap_web_t;
+type swrap_web_exec_t;
+init_daemon_domain(swrap_web_t, swrap_web_exec_t)
+# The unit sets NoNewPrivileges=yes: systemd may still enter the domain.
+init_nnp_daemon_domain(swrap_web_t)
+permissive swrap_web_t;
+
+# Enforcing neighbours that talk to the daemon need their rules now, not later: the sshd PAM
+# helper connects to swrapd's unseal socket (the rule for unconfined_service_t stays while
+# older session workers run in it).
+allow sshd_session_t swrapd_t:unix_stream_socket connectto;
+
+type swrap_vault_t;
+files_type(swrap_vault_t)
+
+type swrap_var_run_t;
+files_pid_file(swrap_var_run_t)
+
+files_search_var_lib(sshd_session_t)
+files_search_pids(sshd_session_t)
+
+allow sshd_session_t swrap_vault_t:dir list_dir_perms;
+allow sshd_session_t swrap_vault_t:file read_file_perms;
+allow sshd_session_t swrap_var_run_t:dir search_dir_perms;
+allow sshd_session_t swrap_var_run_t:file read_file_perms;
+allow sshd_session_t swrap_var_run_t:sock_file write_sock_file_perms;
+allow sshd_session_t unconfined_service_t:unix_stream_socket connectto;
+
+allow sshd_t swrap_var_run_t:dir search_dir_perms;
+allow sshd_t swrap_var_run_t:file read_file_perms;

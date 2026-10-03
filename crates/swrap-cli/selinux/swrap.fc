@@ -1,0 +1,4 @@
+/var/lib/swrap/vault(/.*)?	gen_context(system_u:object_r:swrap_vault_t,s0)
+/run/swrap(/.*)?	gen_context(system_u:object_r:swrap_var_run_t,s0)
+/usr/libexec/swrap/swrapd	--	gen_context(system_u:object_r:swrapd_exec_t,s0)
+/usr/libexec/swrap/swrap-web	--	gen_context(system_u:object_r:swrap_web_exec_t,s0)

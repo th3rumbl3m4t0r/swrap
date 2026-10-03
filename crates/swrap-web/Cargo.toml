@@ -1,0 +1,26 @@
+[package]
+name = "swrap-web"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+swrap-core.workspace = true
+swrec.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+jiff.workspace = true
+tokio.workspace = true
+argon2.workspace = true
+rand.workspace = true
+ipnet.workspace = true
+axum = "0.8"
+hyper = { version = "1", features = ["server", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["server-auto", "tokio", "service"] }
+tower = "0.5"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-pemfile = "2"
+tokio-stream = "0.1"
+futures-util = "0.3"
+libc.workspace = true

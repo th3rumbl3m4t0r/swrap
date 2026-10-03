@@ -1,0 +1,13 @@
+[package]
+name = "swrap-pam-unlock"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+swrap-core.workspace = true
+swrap-vault.workspace = true
+anyhow.workspace = true
+serde_json.workspace = true
+base64.workspace = true
+zeroize.workspace = true
+libc.workspace = true

@@ -1,0 +1,30 @@
+[package]
+name = "swrapd"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+swrap-core.workspace = true
+swrec.workspace = true
+swrap-vault.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+jiff.workspace = true
+clap.workspace = true
+tokio.workspace = true
+libc.workspace = true
+nix.workspace = true
+blake3.workspace = true
+base64.workspace = true
+zeroize.workspace = true
+rand.workspace = true
+argon2.workspace = true
+ipnet.workspace = true
+globset.workspace = true
+sha2 = "0.10"
+ureq = { version = "3.4", default-features = false, features = ["rustls"] }
+httparse = "1"
+vt100 = "0.16"
+ulid.workspace = true

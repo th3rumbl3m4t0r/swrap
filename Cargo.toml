@@ -1,0 +1,46 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+rust-version = "1.85"
+
+[workspace.dependencies]
+swrap-core = { path = "crates/swrap-core" }
+swrec = { path = "crates/swrec" }
+swrap-vault = { path = "crates/swrap-vault" }
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+toml = "0.8"
+jiff = "0.2"
+ulid = "1"
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+libc = "0.2"
+nix = { version = "0.29", features = ["term", "process", "signal", "user", "fs", "socket", "uio", "ioctl", "poll", "mman", "hostname"] }
+crc32c = "0.6"
+blake3 = "1"
+flate2 = "1"
+regex = "1"
+rayon = "1"
+base64 = "0.22"
+vte = "0.13"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+chacha20poly1305 = "0.10"
+argon2 = "0.5"
+zeroize = { version = "1", features = ["derive"] }
+rand = "0.8"
+data-encoding = "2"
+globset = "0.4"
+ipnet = "2"
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 4
+panic = "unwind"
