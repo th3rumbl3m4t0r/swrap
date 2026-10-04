@@ -193,6 +193,14 @@ pub fn main(args: Vec<String>) -> Result<i32> {
     }
     match args.first().map(String::as_str) {
         Some("sync") => {
+            // One sync at a time (the PT15M timer and a manual run would race on the mirrors).
+            let lock = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open("/run/swrap-replica.lock")?;
+            if unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&lock), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+                eprintln!("swrap replica: another sync is running; waiting for it");
+                if unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&lock), libc::LOCK_EX) } != 0 {
+                    bail!("lock /run/swrap-replica.lock: {}", std::io::Error::last_os_error());
+                }
+            }
             let only_data = args.iter().any(|a| a == "--data-only");
             let mut log = vec![];
             let mut errors = vec![];

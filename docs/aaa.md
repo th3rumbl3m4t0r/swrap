@@ -725,6 +725,14 @@ swuser adopt <targets> <ruser>
 - **No passwords.** Accounts are locked with `usermod -p '!'`; the key is the only authenticator.
 - **Drift detection.** Inventory flags `swrap-*` sudoers files that are unexpected or modified. Sudo rules outside `swrap-*` are reported but never touched.
 
+**As built (2026-10-03), 10.4 and 10.5:**
+- `swuser add <targets> <ruser> [--sudo] [--shell] [--uid]`: `useradd -m`, `usermod -p '!'`, a key of its own generated into the vault (the host's root key algorithm), its authorized_keys line written as root (temp file, rename, owner, modes, restorecon), with `--sudo` `/etc/sudoers.d/swrap-<ruser>` (written to a dot-file sudo ignores, `visudo -cf`, renamed into place, 0440). Then a fresh login with the new key (and `sudo -n true`). An account left by an interrupted `add` (it carries swrap's key line) is completed, any other existing one is refused (`adopt` takes those over: key, password locked, an existing swrap sudoers file with the right content counts).
+- `del` (sudoers file, `pkill`, `userdel [-r]`; keys retired), `lock`/`unlock` (`usermod -e 1` / `-e ''`: an expired account cannot log in, not even with its key; verified both ways), `sudo on|off`, `list` (the accounts in the host file checked on the host: exists, expired, sudoers file present and unchanged).
+- Root work runs as root, or through a swrap-managed sudo account on hosts without a root key; that account cannot remove, lock or un-sudo itself.
+- `swrotate <targets> [--user u] [--algo a]`: per account, a new key under a name that sorts after the old one (new sessions keep the old key until the new one is proven), added next to the old one with the old key, verified with a fresh login, the old line removed (by its key blob) with the new key, the old key verified refused, then retired; the account swrap works through goes last. Retired keys (`vault/keys/retired/<label>_<ruser>_<ts>`, also `swdel`'s `<label>_<ts>`) are destroyed after P30D by the daily doctor run.
+- Inventory drift: a `swrap-*` sudoers file is *unexpected* (no managed sudo account), *modified* (its sha256 differs from what swuser writes) or *missing*.
+- Every host is a recorded run (`kind` swuser / swrotate); host files change under the config lock and are committed.
+
 ### 10.6 Targets syntax (all fleet commands)
 
 - **Forms:**
@@ -770,11 +778,11 @@ state/summary.tsv             label, route, os, kernel, #updates, #security, reb
   - **Asset record (table).** After every inventory the `aaa_*` columns of each enrolled host's asset (found by `aaa_label`, else a unique IP address, else hostname; the core by its own hostname) are set through the forms `aaa_asset_read`/`aaa_asset_update` (tokens in the vault): `aaa_label`, `aaa_asimilated` (false again for assets whose host left swrap), and `aaa_running_projects`. Projects come from the collector's git scan (`gitrepos.tsv`: working trees under /opt, /srv, /root, /home, /var/www, /usr/local/src with origin, last commit, use by a running process or a systemd unit); a repository counts when used, or changed within `active_days` (30). Clones of the git server link to its cgit page with the repository's description. Hand-written lines are never changed; lines swrap added are replaced when repositories come and go; a repository a hand-written line already links to is not added. `aaa_ipv4`/`aaa_ipv6` of existing assets stay with the endpoint agent. An enrolled host with no asset is given one through the create-only form `aaa_create_asset` (token `asset-create`) once it has a good inventory: name and `aaa_label` = label, hostname, os, status running, `running_since` = OS install time (the basesystem, filesystem or setup package; /var/lib/dpkg on Debian), type server or virtualServer (`systemd-detect-virt`), health healthy, `aaa_asimilated` true, the IP addresses and the detected projects; purchase date, expected life and notes are left to people. Only when that fails does the "no asset record" ticket go out. Settings: `config/table.toml` (`swrap table set`).
   - **fail2ban (aaa).** swrap-web also writes each failed or throttled login to its journal (`swrap-web: login failed for "<user>" from <address>`, the user quoted), which fail2ban's `swrap-web` jail on the core reads next to `sshd`; the LAN and home are never banned. Bans go to table's IOC list through `ioc-report` (repository `ioc-report` on the git server).
   - **Endpoint agent (table).** The agent (disks, SMART, root filesystem full) needs six table forms of its own per host (`asset_read/update_<id>` bound to the asset, `disk_read/update/create_<id>`, `ticket_create_<id>`), which only a table admin can create. swrap holds the login of the AAA admin account `aaa_adm` (`admin_user`) in the vault (`swrap table admin-password`, stdin or a no-echo prompt; stored only after table accepts it as an admin). A host whose inventory finds no agent, and that has an asset, gets it once a day at most (`agent_auto`): on the core, the agent's own `--provision-env` creates or aligns the forms with that login (every secret regenerated) and writes the host's env to `/run/swrap/eagent` (tmpfs, 0700, removed right after); then, like `swr` and recorded as a run of kind `agent`, the env goes to the host on stdin, never into the recording, the kept script or the output (each form secret is redacted), the checksummed agent is installed to `/usr/local/sbin/endpoint-agent.py`, and `--install` sets up its timer and runs a first update that proves the secrets. The admin login never leaves the core. Hosts reach table at `endpoint` (or `agent_endpoint`); edge hosts at `agent_endpoint_edge`, and without it they get no automatic agent. `swrap table agent <label>` does the same on demand, also on a host that has the agent (rotating its form secrets). Only when the deployment fails does the "endpoint agent not deployed" ticket go out, with the reason.
-  - Not yet: the edge mirror of `state/`.
+  - **Edge mirror (as built 2026-10-03).** swrap-edged long-polls core (`EdgeReq::State`, checked every 5 s) and receives the committed tree (`git archive` of `state/`'s HEAD, without `ai-usage.json`) when it moved on. It is unpacked to `/var/lib/swrap-edge/state.<commit>` (root:swrap-edge, 0750, `REVISION` inside) and `/var/lib/swrap-edge/state` is a symlink swapped atomically; the previous copy is removed. While the link is down the last tree stays readable. Only the tree is mirrored, not the history (`git log -p` stays on core).
 
 ### 10.8 Where fleet jobs run
 
-Fleet jobs run on core, from either origin. From edge, the client forwards the job to core; any script file is uploaded as part of the request, and live output streams back.
+Fleet jobs run on core, from either origin. From edge, the client forwards the job to core; any script file is uploaded as part of the request, and live output streams back (as built: edge relays every output frame to the client as it arrives, a line per host as each finishes, not after the answer).
 
 ### 10.9 `swr` and `swx`
 
@@ -875,7 +883,10 @@ swupdate <targets> --app <pkg>   # dnf -y upgrade --refresh <pkg>   (upgrade onl
 - **Host connections.** On first use of a directory the worker asks swrapd (`Req::SftpBackend`, per-session token), which checks the grant again at that moment, starts the per-connection signing agent (killed once ssh has authenticated, as for `sw`) and returns the ssh command; the worker runs `ssh -s <ruser>@<host> sftp` with the usual pinned-key options. A lost connection fails what was waiting on it; the next access reconnects. Idle connections close after PT5M.
 - **Namespace.** Paths are normalised lexically in the worker, clamped at the virtual root; absolute symlink targets come back re-prefixed, and a new symlink may only point into its own host. The top level is read-only. Rename, hard link and server-side copy work within one host; across hosts they fail (clients fall back to copying). Supported extensions: posix-rename, statvfs, fstatvfs, hardlink, fsync, lsetstat, limits, expand-path (`~` is the virtual root), copy-data, home-directory; an extension the host's server lacks is answered as unsupported.
 - **Recording.** `rec/<user>/sftp/…` (kind `sftp`, signed by core). Every request is an `f` record (op, label, ruser, the path on the host, result, attributes where given); reads and writes are summarised per handle at close as `get`/`put` with byte counts and the blake3 of the content when the whole file went through in order (`partial` otherwise). Search indexes file paths as `label:path`.
-- **Tested** with OpenSSH `sftp`: browse, get, put, rename, mkdir/rmdir, remove, the refusals at the top level, a 64 MiB transfer each way (~90 MB/s on the LAN, recorded hashes identical), a killed host connection (reconnects). Not yet: SFTP for edge logins (11.3 delegated exec), and hosts only reachable through edge (`network = edge`, e.g. web1): opening their directory says so.
+- **Tested** with OpenSSH `sftp`: browse, get, put, rename, mkdir/rmdir, remove, the refusals at the top level, a 64 MiB transfer each way (~90 MB/s on the LAN, recorded hashes identical), a killed host connection (reconnects).
+- **Edge logins (as built 2026-10-03, 11.3 delegated).** Edge's sshd has the same `Subsystem sftp /usr/libexec/swrap/sftp-dispatch` (root, admins and other accounts still get `sftp-server`). An AAA user's SFTP on edge goes to swrap-edged, which delegates the whole session over `core-pty.sock`: the worker runs on core, its recording is core's (`origin=edge exec=core delegated=true`), and the namespace and every backend use the user's *edge* grants (only `edge_allowed` hosts).
+- **Hosts only edge reaches (`network = edge`, e.g. web1).** ssh still runs on core, with the usual per-connection agent, hostbound check and pinned keys; its `ProxyCommand` is `swrapd tunnel <id>`, a one-use tunnel (PT1M, swrap uid only) for which edge opens the TCP connection (`EdgeJob::Connect`) and attaches it to the link. Edge relays only ciphertext. Refused while the link is down.
+- **Tested** with OpenSSH `sftp`: get from web1 through the tunnel (core login), the namespace and a get from web1 for an edge login, root on the edge through its dispatcher.
 
 ---
 
@@ -1156,6 +1167,8 @@ The numbers below are **engineering estimates** meant to guide sizing. Phase 13 
   - In practice the user's terminal emulator is usually the slower side.
 - **fsync.** At most one `fdatasync` per second per actively writing session. Even a consumer SSD under ZFS handles hundreds per second, so this is not a limit at personal scale.
 
+- **Measured (2026-10-03, the reference core: 4 vCPU, 7.5 GiB).** A concurrent `sw` session ~15 MiB on core (README, Performance). A swai session with Claude Code 250–320 MiB (the harness 230–275 MiB, swrap's worker 14–42 MiB): the harness dominates, so `sessions_per_user` (12) and `min_available_mb` (1024) are what bound it; with 4 sessions running, about 15 more fit here. Recorder 690 MB/s CPU-bound (tmpfs), 105–113 MB/s to this VM's disk.
+
 ### 19.2 Storage
 
 | Activity | Raw swrec per hour | After gzip (typ. ×5–×15) |
@@ -1164,6 +1177,7 @@ The numbers below are **engineering estimates** meant to guide sizing. Phase 13 
 | Typical admin work (dnf, logs, config) | 0.5–5 MiB | 0.1–1 MiB |
 | Heavy output (`journalctl -f` on a busy host, builds) | 50–500 MiB | 5–60 MiB |
 
+- **Measured, swai (25 sessions, 414 h):** 0.8 MiB per session-hour on average (0.2–2.6), gzip 4–9×; the TUI stream and tool outputs dominate, messages are stored once each.
 - **Overhead.** JSON framing and escaping add roughly 20–100 % over raw terminal bytes. ANSI-heavy TUIs such as `htop` are at the high end.
 - **Example.** 10 sessions a day of 1 hour each, at 5 MiB/h, is about 50 MiB/day raw. That is roughly 18 GiB/year raw and 2–4 GiB/year compressed. A 100 GiB data disk lasts many years; the 90 % watermark handles the rest.
 
@@ -1223,6 +1237,7 @@ Stage 2 phases are listed in section 24.12 and start only after every Stage 1 ac
 10. **SFTP.** Dispatch, `swrap-sftp`, local and delegated backends, `f` records.
 11. **Firewall and web relay.** `swfw`, the nftables `inet swrap` table on both nodes, edge rate limiting, port/SNI web relay, `swrap-ingress`.
 12. **Retention and operations.** Watermark eviction, compression, doctor and scrub, edge log shipping, SELinux modules, systemd slices and sandboxing, installers `swrap-install core|edge`, RPM specs, and a README with the Proxmox checklist, Stalwart co-location guide, backup guide and threat model.
+    - *As built (2026-10-03), SELinux:* module `swrap` 1.3.0 with `swrapd_t`, `swrap_web_t` and `swrap_ai_t` (the swai harness, own home type, no network beyond its sandbox's loopback), rules drafted from a week of permissive denials and loaded while still permissive; `swrap install selinux [--enforce|--permissive]` switches; `swrap doctor --selinux` lists what enforcement would still deny.
 13. **Benchmarks.**
     - `swrec bench` for recorder throughput.
     - A synthetic load test with N concurrent sessions against a local sshd emitting output; measure RSS per session, added keystroke latency and edge spool behaviour with the link cut.
@@ -1298,6 +1313,8 @@ Stage 2 phases are listed in section 24.12 and start only after every Stage 1 ac
 - `swupdate 'web*'` touches only granted hosts; `--app openssl` skips hosts without the package.
 - `swuser add … --sudo` produces NOPASSWD sudo, and a manual edit is detected as drift.
 - SFTP: only granted entries are visible; the prefix cannot be escaped; `scp` works; admins see the node's real filesystem; all operations produce `f` records; entry routing follows section 4.2.
+
+**As built (2026-10-03): `tests/acceptance/acceptance.sh`.** The safe tests (read-only, or creating and removing their own data on a test host) run by default on the live system: ISO/UTC in CLI output and `--since 7d` refused, the fuzzer, edge-signed records verified on core, no keystrokes in shell recordings, `--secret-env` redaction, search fields kept apart, `swuser --sudo` and sudoers drift, SFTP namespace and `f` records, no key material on edge, mail ports and the `inet swrap` table, SFTP from an edge login, recorder throughput, refusal while sealed. Destructive ones (worker `kill -9`, disk fill to 91 %, link cut, 20 hard VM resets, 20 concurrent edge sessions) run only when named with `SWRAP_ACCEPT_DESTRUCTIVE=yes`, and print their procedure for a scratch setup. First run on core: all safe tests pass (the account test was left out on production hosts); fixed on the way: users now find their own fleet runs in search and the web player (by `who` in the run's meta.toml), `swls` refuses arguments. Recorder: 105–113 MB/s idle, 87–91 MB/s while a build ran.
 
 **Performance** (phase 13)
 - Recorder throughput is at least 100 MB/s per core.
@@ -1491,6 +1508,11 @@ remote_users = ["root"]
   - The API token is stored in the vault, and is restricted to `VM.Snapshot.Rollback` and `VM.PowerMgmt` on that VM only.
   - The command requires an AI grant on the host plus `ai_reset = true` in its host file.
   - Every reset is audited.
+  - **As built (2026-10-03), ready for a token:**
+    - Admin: `swai reset-setup <label> --api https://<pve>:8006 --node <node> --vmid <id> --snapshot <name>` (or `--off`) writes `ai_reset = true` and `[proxmox]` into the host file (the host must have `ai_allowed`); `swai reset-token <label>` stores `user@realm!tokenid=secret` (no-echo prompt or stdin) at `vault/keys/proxmox/<label>.enc`; `swai reset-ca < /etc/pve/pve-root-ca.pem` pins the Proxmox CA (`config/proxmox/ca.pem`; without it the system roots apply).
+    - Token on Proxmox: a role with `VM.Snapshot.Rollback` and `VM.PowerMgmt` only, granted on `/vms/<vmid>` to the token (privilege separation on). Nothing more is called: the rollback asks for `start=1` (older servers without it: rolled back, then `status/start`), and a token may read its own tasks' status.
+    - `swai reset <label> [--force]` (AI users with a grant on the host): refuses while swai sessions work on the host unless `--force`; rollback, task polled to `OK`, VM started; then for core-network hosts waits up to PT5M for ssh and logs in with the pinned host keys (a snapshot older than enrollment, with other host keys, is reported and not connected to). Audit `ai.reset` (started, ok or error, duration), `ai.reset_setup`, `ai.reset_token`, `ai.reset_ca`.
+    - Tested against a fake Proxmox API (request paths, token header, task polling, failed task, servers without `start`); not yet against a real Proxmox VE, which needs the token.
 
 ### 24.6 Inference backends: `swrap-infer`
 
@@ -1507,6 +1529,8 @@ models = ["qwen3-coder"]               # optional allow-list; empty = pass throu
 timeout = "PT10M"
 max_concurrent = 4
 ```
+
+- **As built (2026-10-03): `max_concurrent`.** `swai backend add … --max-concurrent N` / `swai backend set <name> --max-concurrent N` (0 = no limit). Every session's recording proxy takes one of N slots (an `flock` on `/run/swrap/ai-slots/<backend>.<i>`) for the whole request and waits for a free one up to the backend timeout (then 503); a dead worker frees its slot. It is read per request, so a change applies at once.
 
 - **Commands:** `swai backend add|del|list|test <name>` (admin). `test` sends a tiny completion and prints latency, model list and streaming support.
 - **Turnstone configuration.** Turnstone is configured with one provider per backend, pointing at `http://swrap-infer/<name>/…`.
@@ -1578,6 +1602,9 @@ AI sessions get a new record kind `ai` in `rec/<aaa_user>/ai/…`. Each file cov
   - Free text covers all of these.
 - **Player.** An `ai` session renders as a chat transcript: messages, tool calls with expandable arguments and results, and exit codes. It shows token usage and latency per turn, with a timeline scrubber in ISO time.
 - **Cross-links.** Tool calls on a host link to the corresponding `t`/`o` records. Live following works as in Stage 1.
+- **As built (2026-10-03).**
+  - Search: `prompt:`, `reply:`, `tool:` and `args:` (each argument as `key=value`); `cmd:` matches `exec` commands, `out:` tool output; free text covers all of them. The search page has the four fields.
+  - Player: `ai` recordings open on a **chat** tab (next to the TUI player and the text transcript), built from the records by `swrec::ai::chat` (`/api/rec/<id>/chat`): prompts (Claude Code's `<system-reminder>` blocks folded away as "context the harness added"), replies with thinking (or "not shown by the API"), each tool use with its swrap `t` record (target, exit code, duration; arguments and the result the model saw, expandable; a tool that started while its reply was still streaming is paired too), per turn the tokens (input incl. cache read/write, output), time to first token, latency and stop reason, inference errors, helper requests (titles, compaction) and notes. A scrubber sets an ISO time (UTC, or local with the page's box) and marks the turn at that moment; clicking a turn's time moves it there. A tool call's "terminal at …" switches to the TUI player at that moment. Live sessions refresh every 5 s and follow the end. Opened from a search hit, the chat starts at the hit.
 
 ### 24.10 Edge, firewall, CLI
 
@@ -1626,7 +1653,7 @@ AI sessions get a new record kind `ai` in `rec/<aaa_user>/ai/…`. Each file cov
 
 1. **Primary vs. fallback auth, attribution and MCP identity paths.** **Decided in S2.1 from the pinned Turnstone's actual capabilities.**
 2. **Commercial inference APIs** (Anthropic, OpenAI, Gemini) alongside local ones. **Allowed, with keys only in the vault and only through swrap-infer.**
-3. **Turnstone's judge / tool approval.** **On for `exec`, `write_file` and `apply_patch` at first**; relax it once you trust the setup. *As built:* `swai approval ask|allow` (admin, all new sessions); and per session, for **one host only**, the sixth question "permissions" or `swai --loose`: no permission prompts at all (Claude Code runs with `--dangerously-skip-permissions`, so no auto-mode classifier either; opencode allows every tool). The sandbox keeps Claude Code's built-in tools off, so it still acts only on that host through swrap's tools, under the AI grant, recorded; the session header, the audit event (`ai.start`, `loose`), the banner and the session name say so. Refused for the whole AAA. Meant for throwaway VMs.
+3. **Turnstone's judge / tool approval.** **On for `exec`, `write_file` and `apply_patch` at first**; relax it once you trust the setup. *As built, budget and handoff:* a session may make `max_tool_calls` tool calls (500). When `handoff_warn` (25) or fewer are left, every tool result says so; once they are gone a tool call returns an error saying the same. The AI then calls `handoff` (costs no budget) with a briefing: swrapd starts a successor for the same user, host, account, backend, model, effort and permissions, with a fresh budget and a fresh conversation whose first prompt is the briefing plus a digest of the last 40 tool calls. The successor runs detached; a terminal attached to the old session follows it (the old one ends with reason `handoff <id>`). Recordings are linked (`continues`, `chain` in the header; audit `ai.handoff`); at most `max_handoffs` (10) in a row, and `calls_per_hour` still applies. Unattended for real only with `--loose` (otherwise the successor waits at its first permission prompt). `swai limits [<key> <value>]` (admin) shows and sets the limits. *As built:* `swai approval ask|allow` (admin, all new sessions); and per session, for **one host only**, the sixth question "permissions" or `swai --loose`: no permission prompts at all (Claude Code runs with `--dangerously-skip-permissions`, so no auto-mode classifier either; opencode allows every tool). The sandbox keeps Claude Code's built-in tools off, so it still acts only on that host through swrap's tools, under the AI grant, recorded; the session header, the audit event (`ai.start`, `loose`), the banner and the session name say so. Refused for the whole AAA. Meant for throwaway VMs.
 4. **AI GUI access for admins.** **No.**
 5. **Proxmox snapshot reset.** **Implemented only if you provide a scoped API token.**
 6. **Persistent per-session SSH connection for tools.** **Not initially.**

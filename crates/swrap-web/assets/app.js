@@ -2,15 +2,17 @@
 (function () {
   "use strict";
   const $ = (s, r) => (r || document).querySelector(s);
-  const utcBox = $("#utc");
-  let utc = false;
-  try { utc = localStorage.getItem("swrap-utc") === "1"; } catch (e) {}
-  if (utcBox) {
-    utcBox.checked = utc;
-    utcBox.addEventListener("change", () => {
-      utc = utcBox.checked;
-      try { localStorage.setItem("swrap-utc", utc ? "1" : "0"); } catch (e) {}
+  // UTC (Z) unless the "local time" box is ticked (remembered per browser).
+  const localBox = $("#local");
+  let utc = true;
+  try { utc = localStorage.getItem("swrap-local") !== "1"; } catch (e) {}
+  if (localBox) {
+    localBox.checked = !utc;
+    localBox.addEventListener("change", () => {
+      utc = !localBox.checked;
+      try { localStorage.setItem("swrap-local", utc ? "0" : "1"); } catch (e) {}
       document.querySelectorAll("time[data-utc]").forEach(renderTime);
+      document.dispatchEvent(new CustomEvent("swrap-tz"));
     });
   }
   function renderTime(el) { el.textContent = utc ? el.dataset.utc : el.dataset.local; }
@@ -103,6 +105,10 @@
       renderMeta(meta);
       $("#livebadge").hidden = !meta.live;
       build(meta.start_at);
+      if (meta.header.kind === "ai") {
+        $("#tab-chat").hidden = false;
+        if (new URLSearchParams(location.search).get("view") !== "player") await show("chat");
+      }
     }
     function setFont(d) {
       font = Math.max(8, Math.min(28, font + d));
@@ -113,15 +119,122 @@
     $("#font-up").addEventListener("click", () => setFont(+1));
     speedSel.addEventListener("change", () => meta && build(now()));
     keysBox.addEventListener("change", () => { if (meta) build(now()); if (!$("#text").hidden) showText(true); });
+    document.addEventListener("swrap-tz", () => { if (!$("#text").hidden) showText(true); });
     async function showText(reload) {
-      const want = keysBox.checked ? "1" : "0";
+      const want = (keysBox.checked ? "k" : "-") + (utc ? "u" : "l");
       if (reload || textLoaded !== want) {
-        $("#text").textContent = await (await fetch(`/api/rec/${id}/text` + (want === "1" ? "?keys=1" : ""))).text();
+        const qs = [];
+        if (keysBox.checked) qs.push("keys=1");
+        if (!utc) qs.push("local=1");
+        $("#text").textContent = await (await fetch(`/api/rec/${id}/text` + (qs.length ? "?" + qs.join("&") : ""))).text();
         textLoaded = want;
       }
     }
-    $("#tab-play").addEventListener("click", () => { $("#tab-play").classList.add("on"); $("#tab-text").classList.remove("on"); $("#termbox").hidden = false; $("#text").hidden = true; });
-    $("#tab-text").addEventListener("click", async () => { $("#tab-text").classList.add("on"); $("#tab-play").classList.remove("on"); $("#termbox").hidden = true; $("#text").hidden = false; await showText(false); });
+    // Tabs: chat (swai sessions), player, transcript.
+    const views = { chat: "#chatbox", play: "#termbox", text: "#text" };
+    async function show(v) {
+      Object.keys(views).forEach(k => { $("#tab-" + k).classList.toggle("on", k === v); $(views[k]).hidden = k !== v; });
+      if (v === "text") await showText(false);
+      if (v === "chat") await loadChat(false);
+    }
+    Object.keys(views).forEach(k => $("#tab-" + k).addEventListener("click", () => show(k)));
+
+    // ---------------------------------------------------------- swai chat (spec 24.9)
+    let chat = null, chatTimer = null;
+    const scrub = $("#scrub"), scrubT = $("#scrubt");
+    const num = n => String(n || 0).replace(/\B(?=(\d{3})+(?!\d))/g, "\u202f");
+    function isoAt(sec) {
+      if (!chat || !chat.start) return "";
+      const d = new Date(Date.parse(chat.start) + sec * 1000);
+      if (utc) return d.toISOString().replace(/\.\d{3}Z$/, "Z");
+      const p = n => String(n).padStart(2, "0"), off = -d.getTimezoneOffset();
+      return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}${off >= 0 ? "+" : "-"}${p(Math.floor(Math.abs(off) / 60))}:${p(Math.abs(off) % 60)}`;
+    }
+    function el(tag, cls, text) { const e = document.createElement(tag); if (cls) e.className = cls; if (text !== undefined) e.textContent = text; return e; }
+    function pre(text) { const p = el("pre"); p.textContent = text; return p; }
+    function det(summary, body, cls) { const d = el("details", cls); const s = el("summary"); if (summary instanceof Node) s.appendChild(summary); else s.textContent = summary; d.append(s); [].concat(body).forEach(b => d.append(b)); return d; }
+    function head(it, who) {
+      const h = el("div", "head"); const t = timeEl(it.ts_disp || { utc: it.ts, local: it.ts });
+      t.title = "move the time line here"; t.addEventListener("click", () => setScrub(it.t, true));
+      h.append(t, el("span", "who", who)); return h;
+    }
+    function usageLine(u, it) {
+      const parts = [`in ${num(u.in)}` + (u.cache_read || u.cache_write ? ` (cache read ${num(u.cache_read)}, write ${num(u.cache_write)})` : ""), `out ${num(u.out)}`];
+      if (it.ttft) parts.push("first token " + it.ttft);
+      if (it.latency) parts.push(it.latency);
+      if (it.stop) parts.push("stop " + it.stop);
+      return el("div", "meta", parts.join(" · "));
+    }
+    function toolEl(name, input, x) {
+      const s = el("span");
+      const what = x ? (x.args && (x.args.command || x.args.path || x.args.query || x.args.id)) : (input && (input.command || input.path || input.query));
+      s.append("⚙ " + (x ? x.tool : name) + (x && x.target ? ` ${x.ruser}@${x.target}` : "") + (what ? ": " + String(what).split("\n")[0].slice(0, 160) : ""));
+      if (x) {
+        const r = x.error ? el("span", "bad", "  → error") : el("span", x.exit === 0 || x.exit === undefined || x.exit === null ? "ok" : "bad", x.exit === undefined || x.exit === null ? "  → ok" : `  → exit ${x.exit}`);
+        s.append(r, ` (${x.duration})`);
+      } else s.append(el("span", "bad", "  → no result recorded"));
+      const body = [el("div", "meta", "arguments"), pre(JSON.stringify(x ? x.args : input, null, 2))];
+      if (x) {
+        body.push(el("div", "meta", "result" + (x.cut ? " (first 64 KiB; the full output is in the recording)" : "") + ` · ${num(x.out_bytes)} bytes out, ${num(x.err_bytes)} err`), pre(x.result || ""));
+        const b = el("button", "link", "▶ terminal at " + isoAt(x.started_t)); b.type = "button";
+        b.addEventListener("click", async () => { await show("play"); if (player) { player.seek(Math.max(0, x.started_t - 0.5)); player.play(); } });
+        body.push(b);
+      }
+      return det(s, body, "tool");
+    }
+    function renderChat() {
+      const box = $("#chat"), atEnd = box.scrollTop + box.clientHeight >= box.scrollHeight - 20;
+      box.textContent = "";
+      chat.items.forEach(it => {
+        let d;
+        if (it.type === "prompt") {
+          d = el("div", "item user"); d.append(head(it, "▶ " + (meta.header.aaa_user || "user")));
+          if (it.text) d.append(el("div", "txt", it.text + (it.cut ? "\n…" : "")));
+          if (it.context && it.context.length) d.append(det(`context the harness added (${it.context.length})`, it.context.map(pre), "ctx"));
+        } else if (it.type === "reply") {
+          d = el("div", "item ai"); d.append(head(it, "◀ " + (it.model || "model") + " #" + it.n));
+          (it.thinking || []).forEach(t => d.append(t ? det("thinking", pre(t), "ctx") : el("div", "meta", "thinking (not shown by the API)")));
+          if (it.text) d.append(el("div", "txt", it.text + (it.cut ? "\n…" : "")));
+          (it.tools || []).forEach(u => d.append(toolEl(u.name, u.input, u.exec)));
+          d.append(usageLine(it.usage || {}, it));
+        } else if (it.type === "tool") {
+          d = el("div", "item"); d.append(head(it, "tool call"), toolEl(it.exec.tool, it.exec.args, it.exec));
+        } else if (it.type === "error") {
+          d = el("div", "item err"); d.append(head(it, "✗ inference error" + (it.status && it.status !== 200 ? " (HTTP " + it.status + ")" : "") + (it.cancelled ? " (cancelled)" : "")), el("div", "txt", it.error || ""));
+        } else if (it.type === "helper") {
+          d = el("div", "item dim"); d.append(head(it, `helper request #${it.n} (${it.model || "model"}: title, compaction…)`), usageLine(it.usage || {}, it));
+        } else {
+          d = el("div", "item dim"); d.append(head(it, "note"), el("div", "txt", it.msg || ""));
+        }
+        d.dataset.t = it.t; box.appendChild(d);
+      });
+      if (chat.end && chat.end.ts) { const d = el("div", "item dim"); d.append(head(chat.end, `end: ${chat.end.reason}` + (chat.end.exit_code !== undefined && chat.end.exit_code !== null ? ` (exit code ${chat.end.exit_code})` : ""))); d.dataset.t = chat.end.t; box.appendChild(d); }
+      const t = chat.totals || {};
+      $("#chattotals").textContent = `${t.requests} requests, ${t.tool_calls} tool calls, ${t.errors} errors · in ${num(t.in)} · out ${num(t.out)}` + (t.helper_requests ? ` · ${t.helper_requests} helper requests` : "");
+      const last = chat.end && chat.end.t ? chat.end.t : (chat.items.length ? chat.items[chat.items.length - 1].t : 0);
+      scrub.max = String(Math.max(0, last));
+      if (chat.live && atEnd) { box.scrollTop = box.scrollHeight; setScrub(last, false); } else scrubT.textContent = isoAt(parseFloat(scrub.value));
+    }
+    function setScrub(sec, move) {
+      scrub.value = String(sec); scrubT.textContent = isoAt(sec);
+      const items = [...$("#chat").children];
+      let cur = null; items.forEach(e => { e.classList.remove("at"); if (parseFloat(e.dataset.t) <= sec + 0.001) cur = e; });
+      if (cur) { cur.classList.add("at"); if (move) cur.scrollIntoView({ block: "center" }); }
+    }
+    scrub.addEventListener("input", () => setScrub(parseFloat(scrub.value), true));
+    document.addEventListener("swrap-tz", () => { if (chat) scrubT.textContent = isoAt(parseFloat(scrub.value)); });
+    async function loadChat(reload) {
+      if (chat && !reload) return;
+      chat = await (await fetch(`/api/rec/${id}/chat`)).json();
+      renderChat();
+      if (!reload) {
+        // Opened from a search hit: start at that moment.
+        const t0 = Date.parse(chat.start), a = Date.parse(at);
+        if (at && t0 && a) setScrub(Math.max(0, (a - t0) / 1000), true);
+      }
+      if (chat.live && !chatTimer) chatTimer = setInterval(() => { if (!$("#chatbox").hidden) loadChat(true); }, 5000);
+      if (!chat.live && chatTimer) { clearInterval(chatTimer); chatTimer = null; }
+    }
     function renderMeta(m) {
       const dl = $("#meta"); dl.textContent = "";
       const h = m.header;

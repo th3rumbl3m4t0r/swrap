@@ -15,6 +15,7 @@ struct Jobs {
     queue: Mutex<VecDeque<(Instant, EdgeJob)>>,
     waiters: Mutex<HashMap<String, mpsc::Sender<Value>>>,
     parked: Mutex<HashMap<String, (Instant, UnixStream)>>,
+    tunnels: Mutex<HashMap<String, (Instant, String, u16)>>,
 }
 
 fn jobs() -> &'static Jobs {
@@ -24,7 +25,7 @@ fn jobs() -> &'static Jobs {
 
 fn job_id(j: &EdgeJob) -> &str {
     match j {
-        EdgeJob::Keyscan { id, .. } | EdgeJob::Exec { id, .. } | EdgeJob::Session { id, .. } => id,
+        EdgeJob::Keyscan { id, .. } | EdgeJob::Exec { id, .. } | EdgeJob::Session { id, .. } | EdgeJob::Connect { id, .. } => id,
     }
 }
 
@@ -74,4 +75,37 @@ pub fn park(id: &str, s: UnixStream) {
 
 pub fn take(id: &str) -> Option<UnixStream> {
     jobs().parked.lock().unwrap().remove(id).map(|(_, s)| s)
+}
+
+/// A tunnel to `addr:port` through edge that one `EdgeTunnel { id }` may use within PT1M.
+pub fn add_tunnel(id: &str, addr: &str, port: u16) {
+    let mut t = jobs().tunnels.lock().unwrap();
+    t.retain(|_, (at, ..)| at.elapsed() < Duration::from_secs(60));
+    t.insert(id.to_string(), (Instant::now(), addr.to_string(), port));
+}
+
+pub fn take_tunnel(id: &str) -> Option<(String, u16)> {
+    jobs().tunnels.lock().unwrap().remove(id).filter(|(at, ..)| at.elapsed() < Duration::from_secs(60)).map(|(_, a, p)| (a, p))
+}
+
+/// `Req::EdgeTunnel` (swrap uid only): answer, park the connection, ask edge to connect.
+pub fn open_tunnel(swrap_uid: u32, caller_uid: u32, id: &str, mut s: UnixStream) -> Result<()> {
+    use swrap_core::frame::{kind, write_frame, Frame};
+    let r = if caller_uid != swrap_uid {
+        Err(anyhow::anyhow!("permission denied"))
+    } else {
+        take_tunnel(id).ok_or_else(|| anyhow::anyhow!("no such tunnel (used or expired)"))
+    };
+    match r {
+        Ok((addr, port)) => {
+            write_frame(&mut s, &Frame::json(kind::RESP, &swrap_core::api::Resp::ok(serde_json::json!({}))))?;
+            park(id, s);
+            enqueue(EdgeJob::Connect { id: id.to_string(), addr, port });
+            Ok(())
+        }
+        Err(e) => {
+            let _ = write_frame(&mut s, &Frame::json(kind::RESP, &swrap_core::api::Resp::err(format!("{e:#}"))));
+            Ok(())
+        }
+    }
 }

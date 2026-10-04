@@ -1,0 +1,199 @@
+/* x11 theme, the shared look of the author's web pages; swrap-web layers assets/app.css on top. */
+/* =========================================================================
+   x11 theme — minimalist X11 / BlackArch-style.
+   One adjustable accent (--accent), night / day palettes, sharp corners,
+   no easing beyond .08s colour flips. Everything derives from variables so
+   theme + accent are live-swappable (x11.js sets the classes and --accent).
+   ========================================================================= */
+
+:root {
+  --accent: #3b8a3e;
+  --accent-soft: color-mix(in srgb, var(--accent) 22%, transparent);
+
+  --font-mono: "DejaVu Sans Mono", "JetBrains Mono", "IBM Plex Mono",
+               "Menlo", "Consolas", "Liberation Mono", monospace;
+
+  /* night palette doubles as the no-JS default */
+  --bg: #17110c;
+  --panel: #201810;
+  --panel-2: #281f16;
+  --fg: #ddd2c4;
+  --fg-dim: #8c7f6d;
+  --border: #4a3c2d;
+  --titlebar: #120d08;
+  --ok: #7bbf6a;
+  --warn: #d0a040;
+  --danger: #c0473b;
+  color-scheme: dark;
+}
+
+/* ---- Night (default): dark brown ---- */
+.theme-night {
+  --bg: #17110c;
+  --panel: #201810;
+  --panel-2: #281f16;
+  --fg: #ddd2c4;
+  --fg-dim: #8c7f6d;
+  --border: #4a3c2d;
+  --titlebar: #120d08;
+  --ok: #7bbf6a;
+  --warn: #d0a040;
+  --danger: #c0473b;
+  color-scheme: dark;
+}
+
+/* ---- Day: cool grey ---- */
+.theme-day {
+  --bg: #ccd2da;
+  --panel: #dbe0e6;
+  --panel-2: #e9edf1;
+  --fg: #1f262e;
+  --fg-dim: #5a636f;
+  --border: #a6afbb;
+  --titlebar: #bfc7d1;
+  --ok: #2f7a2a;
+  --warn: #8a6300;
+  --danger: #a8322a;
+  color-scheme: light;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0; padding: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--font-mono);
+  font-size: 13px;
+  line-height: 1.4;
+  -webkit-font-smoothing: antialiased;
+}
+::selection { background: var(--accent); color: var(--bg); }
+html { scrollbar-color: var(--border) var(--bg); }
+
+a { color: var(--accent); }
+
+button, input, select, textarea {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--fg);
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 0;            /* sharp corners — X11 feel */
+  padding: 4px 7px;
+  outline: none;
+}
+input:focus, select:focus, textarea:focus { border-color: var(--accent); }
+input[type="checkbox"], input[type="radio"] { accent-color: var(--accent); }
+button, input[type="submit"], input[type="button"], input[type="reset"] {
+  cursor: pointer;
+  text-transform: lowercase;
+  letter-spacing: .3px;
+  transition: background .08s, border-color .08s, color .08s;
+}
+button:hover, input[type="submit"]:hover, input[type="button"]:hover, input[type="reset"]:hover {
+  border-color: var(--accent); color: var(--accent);
+}
+button.primary { border-color: var(--accent); color: var(--accent); }
+button.primary:hover { background: var(--accent); color: var(--bg); }
+button:disabled { opacity: .4; cursor: not-allowed; }
+button:disabled:hover { border-color: var(--border); color: var(--fg); }
+button.danger:hover { border-color: var(--danger); color: var(--danger); }
+/* an <a> styled like a button */
+a.btn-link {
+  display: inline-block; font-family: var(--font-mono); font-size: 12px;
+  color: var(--fg); background: var(--panel-2); border: 1px solid var(--border);
+  padding: 4px 7px; text-decoration: none; text-transform: lowercase; letter-spacing: .3px;
+  cursor: pointer; transition: border-color .08s, color .08s;
+}
+a.btn-link:hover { border-color: var(--accent); color: var(--accent); }
+input[type="color"] { width: 26px; height: 22px; padding: 0; cursor: pointer; }
+input[type="file"]::file-selector-button {
+  font-family: var(--font-mono); font-size: 12px; color: var(--fg);
+  background: var(--panel); border: 1px solid var(--border); border-radius: 0;
+  padding: 2px 7px; margin-right: 8px; cursor: pointer;
+  text-transform: lowercase; transition: border-color .08s, color .08s;
+}
+input[type="file"]::file-selector-button:hover { border-color: var(--accent); color: var(--accent); }
+
+/* ---- window titlebar ---- */
+.titlebar {
+  background: var(--titlebar);
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: normal;
+  text-transform: uppercase;
+  letter-spacing: 1.5px;
+  padding: 3px 8px;
+  margin: 0;
+  border-bottom: 1px solid var(--border);
+  display: flex; align-items: center; gap: 8px;
+}
+.titlebar .grip { color: var(--fg-dim); }
+.titlebar .spacer { flex: 1; }
+
+/* ---- a framed window: .win > .titlebar + .body ---- */
+.win { background: var(--panel); border: 1px solid var(--border); }
+.win > .body { padding: 8px 10px; }
+
+/* ---- top bar ---- */
+#topbar {
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+}
+#topbar .bar {
+  display: flex; align-items: center; gap: 10px;
+  padding: 5px 9px;
+  flex-wrap: wrap;
+}
+#topbar .brand {
+  color: var(--accent);
+  font-weight: bold; letter-spacing: 2px;
+  text-transform: uppercase;
+  text-decoration: none;
+  padding-right: 6px; border-right: 1px solid var(--border);
+}
+#topbar .brand small { color: var(--fg-dim); font-weight: normal; letter-spacing: 0; text-transform: none; }
+#topbar .group { display: flex; align-items: center; gap: 5px; }
+#topbar .spacer { flex: 1; }
+#topbar nav { display: flex; gap: 0; }
+#topbar nav a {
+  color: var(--fg-dim); text-decoration: none; padding: 1px 7px;
+  border: 1px solid transparent;
+}
+#topbar nav a:hover { color: var(--accent); border-color: var(--border); }
+/* selected = inverted block, like a dwm tag */
+#topbar nav a.on { color: var(--bg); background: var(--accent); border-color: var(--accent); }
+/* another host: set apart by a dashed rule and arrowed */
+#topbar nav a.ext { margin-left: 6px; border-left: 1px dashed var(--border); }
+a.ext::after { content: " \2197"; }
+label.lbl, .lbl { color: var(--fg-dim); font-size: 11px; text-transform: uppercase; letter-spacing: .5px; }
+
+/* ---- status bar ---- */
+.statusbar {
+  background: var(--titlebar); border-top: 1px solid var(--border);
+  display: flex; align-items: center; gap: 14px;
+  padding: 3px 9px; font-size: 11px; color: var(--fg-dim);
+}
+.statusbar .spacer { flex: 1; }
+
+/* ---- tables ---- */
+table.x11 { width: 100%; border-collapse: collapse; font-size: 12px; }
+table.x11 th, table.x11 td { border-bottom: 1px solid var(--border); padding: 4px 7px; text-align: left; vertical-align: top; }
+table.x11 th { color: var(--fg-dim); text-transform: uppercase; font-size: 10px; letter-spacing: .5px; font-weight: normal; }
+table.x11 tr:hover td { background: var(--panel-2); }
+
+/* ---- state colours ---- */
+.ok { color: var(--ok); }
+.warn { color: var(--warn); }
+.bad, .err { color: var(--danger); }
+.dim { color: var(--fg-dim); }
+
+/* ---- theme controls (filled in by x11.js) ---- */
+.x11-controls { display: inline-flex; align-items: center; gap: 5px; }
+.x11-controls .x11-mode { min-width: 52px; }
+.x11-float {
+  position: fixed; top: 0; right: 0; z-index: 9999;
+  background: var(--panel); border: 1px solid var(--border);
+  border-top: 0; border-right: 0; padding: 3px 6px;
+}

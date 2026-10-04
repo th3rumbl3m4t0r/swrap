@@ -45,6 +45,7 @@ impl Edge {
             swrap_core::time::fmt_display(*self.down_since.lock().unwrap(), &self.tz(), false)
         )
     }
+    /// Times are UTC (ISO 8601 with Z) everywhere.
     fn tz(&self) -> String {
         swrap_core::time::DEFAULT_ZONE.into()
     }
@@ -85,6 +86,25 @@ async fn core_call(e: &Edge, req: &EdgeReq, mut on_frame: impl FnMut(&Frame)) ->
                 return Ok(f.parse()?);
             }
             Some(f) => on_frame(&f),
+            None => {
+                e.set_link(false);
+                bail!("{}", e.down_msg())
+            }
+        }
+    }
+}
+
+/// Like `core_call`, but every frame before the answer is written to `client` right away.
+async fn core_relay(e: &Edge, req: &EdgeReq, client: &mut UnixStream) -> Result<Resp> {
+    let mut s = core_connect(e).await?;
+    aio::write_frame(&mut s, &Frame::json(kind::REQ, req)).await?;
+    loop {
+        match aio::read_frame(&mut s).await? {
+            Some(f) if f.kind == kind::RESP => {
+                e.set_link(true);
+                return Ok(f.parse()?);
+            }
+            Some(f) => aio::write_frame(client, &f).await.context("client went away")?,
             None => {
                 e.set_link(false);
                 bail!("{}", e.down_msg())
@@ -134,6 +154,7 @@ pub fn main() -> Result<()> {
         eprintln!("swrap-edged: started");
         tokio::spawn(hello_loop(e.clone()));
         tokio::spawn(snapshot_loop(e.clone()));
+        tokio::spawn(state_loop(e.clone()));
         tokio::spawn(spool_loop(e.clone()));
         tokio::spawn(log_loop(e.clone()));
         tokio::spawn(web_relay(e.clone()));
@@ -204,6 +225,21 @@ async fn run_job(e: Arc<Edge>, job: swrap_core::api::EdgeJob) {
             let res = exec_job(&e, &plan, &stdin_b64, timeout_secs).await.unwrap_or_else(|err| json!({"code": 255, "stdout_b64": "", "stderr": format!("edge: {err:#}"), "ssh_log": ""}));
             let _ = std::fs::remove_dir_all(e.paths.session_dir(&plan.id));
             let _ = core_call(&e, &EdgeReq::JobResult { id, result: res }, |_| {}).await;
+        }
+        EdgeJob::Connect { id, addr, port } => {
+            let tcp = tokio::time::timeout(Duration::from_secs(15), tokio::net::TcpStream::connect((addr.as_str(), port))).await;
+            let Ok(mut s) = core_connect(&e).await else { return };
+            if aio::write_frame(&mut s, &Frame::json(kind::REQ, &EdgeReq::Attach { id })).await.is_err() {
+                return;
+            }
+            match tcp {
+                Ok(Ok(mut t)) => {
+                    let _ = t.set_nodelay(true);
+                    let _ = tokio::io::copy_bidirectional(&mut s, &mut t).await;
+                }
+                Ok(Err(err)) => ship_line(&e, format!("tunnel to {addr}:{port} failed: {err}")).await,
+                Err(_) => ship_line(&e, format!("tunnel to {addr}:{port} timed out")).await,
+            }
         }
         EdgeJob::Session { id, user, plan, cols, rows, term } => {
             let Ok(mut s) = core_connect(&e).await else { return };
@@ -287,6 +323,75 @@ fn verify_snapshot(e: &Edge, text: &str, sig: &str) -> Result<()> {
     let _ = std::fs::remove_file(&tmp);
     if !o.status.success() {
         bail!("snapshot signature invalid: {}", String::from_utf8_lossy(&o.stderr).trim());
+    }
+    Ok(())
+}
+
+/// The read-only mirror of core's inventory tree (`state/`, spec 10.7): `state` is a symlink to
+/// `state.<commit>`, replaced atomically when core's tree moves on (it holds `REVISION`).
+async fn state_loop(e: Arc<Edge>) {
+    loop {
+        let have = std::fs::read_to_string(e.paths.state().join("REVISION")).map(|s| s.trim().to_string()).unwrap_or_default();
+        let mut tree = vec![];
+        match core_call(&e, &EdgeReq::State { have: have.clone() }, |f| {
+            if f.kind == kind::DATA && tree.len() < (256 << 20) {
+                tree.extend_from_slice(&f.payload);
+            }
+        })
+        .await
+        {
+            Ok(r) if r.ok => {
+                let head = r.data["head"].as_str().unwrap_or("").to_string();
+                if head != have && !tree.is_empty() {
+                    let e2 = e.clone();
+                    let h2 = head.clone();
+                    match tokio::task::spawn_blocking(move || accept_state(&e2, &h2, &tree)).await {
+                        Ok(Ok(())) => ship_line(&e, format!("state mirror at {}", &head[..head.len().min(12)])).await,
+                        Ok(Err(err)) => {
+                            ship_line(&e, format!("state mirror update failed: {err:#}")).await;
+                            tokio::time::sleep(Duration::from_secs(60)).await;
+                        }
+                        Err(_) => tokio::time::sleep(Duration::from_secs(60)).await,
+                    }
+                }
+            }
+            _ => tokio::time::sleep(Duration::from_secs(5)).await,
+        }
+    }
+}
+
+fn accept_state(e: &Edge, head: &str, tree: &[u8]) -> Result<()> {
+    if head.len() < 7 || !head.bytes().all(|b| b.is_ascii_hexdigit()) {
+        bail!("bad revision {head:?}");
+    }
+    let link = e.paths.state();
+    let parent = link.parent().context("state path")?.to_path_buf();
+    let dir = parent.join(format!("state.{head}"));
+    let tmp = parent.join(format!(".state.{head}.tmp"));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp)?;
+    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o750))?;
+    let mut tar = Command::new("tar").args(["-xzf", "-", "-C"]).arg(&tmp).args(["--no-same-owner", "--no-overwrite-dir"]).stdin(std::process::Stdio::piped()).spawn()?;
+    tar.stdin.take().context("tar stdin")?.write_all(tree)?;
+    if !tar.wait()?.success() {
+        let _ = std::fs::remove_dir_all(&tmp);
+        bail!("unpacking the tree failed");
+    }
+    std::fs::write(tmp.join("REVISION"), format!("{head}\n"))?;
+    std::os::unix::fs::chown(&tmp, Some(0), Some(e.gid))?;
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::rename(&tmp, &dir)?;
+    // Swap the symlink atomically; a real directory left from before becomes the old copy.
+    let new_link = parent.join(".state.link");
+    let _ = std::fs::remove_file(&new_link);
+    std::os::unix::fs::symlink(dir.file_name().context("name")?, &new_link)?;
+    if link.exists() && !link.is_symlink() {
+        std::fs::rename(&link, parent.join("state.before-mirror"))?;
+    }
+    let old = std::fs::read_link(&link).ok();
+    std::fs::rename(&new_link, &link)?;
+    if let Some(o) = old.filter(|o| o.as_path() != dir.file_name().map(std::path::Path::new).unwrap_or(std::path::Path::new(""))) {
+        let _ = std::fs::remove_dir_all(parent.join(o));
     }
     Ok(())
 }
@@ -505,6 +610,11 @@ async fn handle_client(e: Arc<Edge>, mut s: UnixStream) -> Result<()> {
     match req {
         Req::Shell { .. } => start_shell(&e, &name, cred.uid, req, s).await,
         Req::Sw { .. } => start_sw(&e, &name, req, s).await,
+        // SFTP from edge logins runs on core (worker, recording); this node relays the bytes.
+        Req::Sftp { ref client_addr, .. } => {
+            let ca = client_addr.clone();
+            delegate(&e, &name, &ca, req, s).await
+        }
         // swai runs on core; this node only relays the terminal (like a delegated sw).
         Req::AiStart { ref client_addr, .. } | Req::AiAttach { ref client_addr, .. } => {
             let ca = client_addr.clone();
@@ -519,15 +629,11 @@ async fn handle_client(e: Arc<Edge>, mut s: UnixStream) -> Result<()> {
             reply(&mut s, Resp::ok(json!({"user": name, "node": "edge", "link": e.link_up.load(Ordering::SeqCst)}))).await
         }
         other => {
+            // Output frames (fleet jobs: a line per host as it finishes) go to the client as
+            // they come, not after the answer.
             let fwd = EdgeReq::Api { user: name, client_addr: String::new(), req: other };
-            let mut frames = vec![];
-            match core_call(&e, &fwd, |f| frames.push(f.clone())).await {
-                Ok(r) => {
-                    for f in frames {
-                        aio::write_frame(&mut s, &f).await?;
-                    }
-                    reply(&mut s, r).await
-                }
+            match core_relay(&e, &fwd, &mut s).await {
+                Ok(r) => reply(&mut s, r).await,
                 Err(err) => reply(&mut s, Resp::err(err)).await,
             }
         }
@@ -679,6 +785,7 @@ async fn delegate(e: &Arc<Edge>, name: &str, client_addr: &str, req: Req, mut s:
             return reply(&mut s, Resp::err(e.down_msg())).await;
         }
     };
+    let kind_name = if matches!(req, Req::Sftp { .. }) { "sftp" } else { "sw" };
     aio::write_frame(&mut up, &Frame::json(kind::REQ, &EdgePty { user: name.into(), client_addr: client_addr.into(), req })).await?;
     let Some(first) = aio::read_frame(&mut up).await? else { return reply(&mut s, Resp::err(e.down_msg())).await };
     aio::write_frame(&mut s, &first).await?;
@@ -686,7 +793,7 @@ async fn delegate(e: &Arc<Edge>, name: &str, client_addr: &str, req: Req, mut s:
         let r: Resp = first.parse()?;
         r.data["id"].as_str().filter(|i| swrap_core::paths::safe_component(i)).map(|id| {
             let p = e.paths.live().join(id);
-            let _ = std::fs::write(&p, json!({"id": id, "user": name, "kind": "sw", "pid": std::process::id(), "delegated": true}).to_string());
+            let _ = std::fs::write(&p, json!({"id": id, "user": name, "kind": kind_name, "pid": std::process::id(), "delegated": true}).to_string());
             p
         })
     } else {

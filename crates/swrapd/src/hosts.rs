@@ -577,6 +577,8 @@ fn swadd(d: &Arc<Daemon>, c: &Caller, a: Swadd, con: &Console) -> Result<Resp> {
             enroll_progress: vec![],
             network,
             ai_allowed: false,
+            ai_reset: false,
+            proxmox: None,
         };
         d.write_config(&format!("hosts/{}.toml", a.label), &h.to_toml())?;
         d.commit(&format!("swadd {} {} by {}", a.label, a.host, c.name))?;
@@ -901,6 +903,7 @@ echo dropin-pending
             sudo: "n/a".into(),
             managed_by_swrap: false,
             integration,
+            locked: false,
         });
         h.enroll_progress.clear();
         d.write_config(&format!("known_hosts/{}", a.label), &known)?;

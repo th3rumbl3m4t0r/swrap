@@ -111,6 +111,31 @@ async fn handle_api(d: Arc<Daemon>, mut s: UnixStream) -> Result<()> {
             let _ = std::fs::remove_file(d.paths.live().join(&id));
             Ok(())
         }
+        EdgeReq::State { have } => {
+            // Long-poll like Snapshot: the committed tree as soon as state/ moved past `have`
+            // (it moves every PT6H; checked every 5 s).
+            for _ in 0..5 {
+                let d2 = d.clone();
+                let head = tokio::task::spawn_blocking(move || {
+                    swrap_core::git::Repo::new(d2.paths.state()).run_as(d2.swrap_uid, d2.swrap_gid).git(&["rev-parse", "HEAD"]).map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                })
+                .await??;
+                if head != have {
+                    let d2 = d.clone();
+                    let h2 = head.clone();
+                    let tree = tokio::task::spawn_blocking(move || {
+                        swrap_core::git::Repo::new(d2.paths.state()).run_as(d2.swrap_uid, d2.swrap_gid).git(&["archive", "--format=tar.gz", &h2, ":(exclude)ai-usage.json"]).map(|o| o.stdout)
+                    })
+                    .await??;
+                    for chunk in tree.chunks(512 << 10) {
+                        aio::write_frame(&mut s, &Frame::new(kind::DATA, chunk.to_vec())).await?;
+                    }
+                    return resp(&mut s, &Resp::ok(json!({"head": head, "bytes": tree.len()}))).await;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            }
+            resp(&mut s, &Resp::ok(json!({"head": have}))).await
+        }
         EdgeReq::Snapshot { have } => {
             // Long-poll: answer as soon as a newer signed snapshot exists, else after ~PT25S.
             for _ in 0..25 {
@@ -128,7 +153,7 @@ async fn handle_api(d: Arc<Daemon>, mut s: UnixStream) -> Result<()> {
         EdgeReq::Api { user, client_addr, req } => {
             let c = d.edge_caller(&user)?;
             // Session requests from edge use Authorize / core-pty; the rest runs as usual.
-            if matches!(req, Req::Sw { .. } | Req::Shell { .. } | Req::AiStart { .. } | Req::AiAttach { .. } | Req::AiWorker { .. } | Req::Sftp { .. } | Req::SftpBackend { .. }) {
+            if matches!(req, Req::Sw { .. } | Req::Shell { .. } | Req::AiStart { .. } | Req::AiAttach { .. } | Req::AiWorker { .. } | Req::Sftp { .. } | Req::SftpBackend { .. } | Req::EdgeTunnel { .. }) {
                 return resp(&mut s, &Resp::err("use authorize/core-pty for sessions")).await;
             }
             let _ = client_addr;
@@ -214,11 +239,16 @@ async fn handle_pty(d: Arc<Daemon>, mut s: UnixStream) -> Result<()> {
     let Some(f) = aio::read_frame(&mut s).await? else { return Ok(()) };
     let ep: EdgePty = f.parse()?;
     let c = d.edge_caller(&ep.user)?;
-    if !matches!(ep.req, Req::Sw { .. } | Req::AiStart { .. } | Req::AiAttach { .. }) {
-        bail!("only sw and swai sessions are delegated");
+    if !matches!(ep.req, Req::Sw { .. } | Req::AiStart { .. } | Req::AiAttach { .. } | Req::Sftp { .. }) {
+        bail!("only sw, swai and SFTP sessions are delegated");
     }
     let std = s.into_std()?;
     std.set_nonblocking(false)?;
+    if matches!(ep.req, Req::Sftp { .. }) {
+        // SFTP from edge logins runs on core (spec 11.3 delegated): worker, recording, grants.
+        tokio::task::spawn_blocking(move || crate::sftp::start(d, c, ep.req, std)).await??;
+        return Ok(());
+    }
     if matches!(ep.req, Req::AiStart { .. }) {
         // swai always runs on core (opencode, the vault and the backends live here).
         tokio::task::spawn_blocking(move || crate::ai::start(d, c, ep.req, std, swrap_core::rbac::Node::Edge, true)).await??;

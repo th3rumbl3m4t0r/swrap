@@ -54,7 +54,12 @@ fn run(cmd: &str, args: Vec<String>) -> Result<i32> {
         "swai" => swai::main(args),
         "swai-sandbox" => swai::sandbox(args),
         "swai-mcp" => swai::mcp(),
-        "swls" => Ok(client::finish(&client::call(&Req::Ls)?)),
+        "swls" => {
+            if let Some(a) = args.first() {
+                anyhow::bail!("swls takes no arguments (got {a}); it lists the hosts and accounts you may use");
+            }
+            Ok(client::finish(&client::call(&Req::Ls)?))
+        }
         "swlog" => swlog(args),
         "swcat" => swcat(args),
         "swplay" => swplay(args),
@@ -78,7 +83,7 @@ fn run(cmd: &str, args: Vec<String>) -> Result<i32> {
             admin("swunlock", args, Some(pw.to_string()))
         }
         "swadm" => swadm(args),
-        "swadd" | "swdel" | "swcrypto" | "swedge" => admin(cmd, args, None),
+        "swadd" | "swdel" | "swcrypto" | "swedge" | "swuser" | "swrotate" => admin(cmd, args, None),
         "swfw" => {
             // --my-ip: the address this SSH session comes from.
             let mut args = args;

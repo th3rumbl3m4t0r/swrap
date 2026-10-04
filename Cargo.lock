@@ -1592,7 +1592,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "swrap-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1613,7 +1613,7 @@ dependencies = [
 
 [[package]]
 name = "swrap-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "blake3",
@@ -1634,7 +1634,7 @@ dependencies = [
 
 [[package]]
 name = "swrap-pam-unlock"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1647,7 +1647,7 @@ dependencies = [
 
 [[package]]
 name = "swrap-shell"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "libc",
@@ -1659,7 +1659,7 @@ dependencies = [
 
 [[package]]
 name = "swrap-vault"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "argon2",
@@ -1679,7 +1679,7 @@ dependencies = [
 
 [[package]]
 name = "swrap-web"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "argon2",
@@ -1705,7 +1705,7 @@ dependencies = [
 
 [[package]]
 name = "swrapd"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "argon2",
@@ -1735,7 +1735,7 @@ dependencies = [
 
 [[package]]
 name = "swrec"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",

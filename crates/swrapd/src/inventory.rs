@@ -200,6 +200,33 @@ fn nevra_name(p: &str) -> &str {
     name.unwrap_or(p)
 }
 
+/// swrap-* sudoers files against what swuser wrote for the host's accounts (spec 10.5):
+/// unexpected, modified (by content hash) or missing.
+fn sudoers_drift(h: &Host, found: &[String]) -> Vec<String> {
+    use sha2::Digest;
+    let want: BTreeMap<String, String> = h
+        .accounts
+        .iter()
+        .filter(|a| a.managed_by_swrap && a.sudo == "nopasswd")
+        .map(|a| (format!("/etc/sudoers.d/swrap-{}", a.name), format!("{:x}", sha2::Sha256::digest(swrap_core::config::swrap_sudoers(&a.name).as_bytes()))[..16].to_string()))
+        .collect();
+    let mut drift = vec![];
+    for l in found {
+        let (path, hash) = l.split_once('\t').unwrap_or((l.as_str(), ""));
+        match want.get(path) {
+            None => drift.push(format!("unexpected {path}")),
+            Some(w) if w != hash.trim() => drift.push(format!("modified {path}")),
+            _ => {}
+        }
+    }
+    for p in want.keys() {
+        if !found.iter().any(|l| l.split('\t').next() == Some(p.as_str())) {
+            drift.push(format!("missing {p}"));
+        }
+    }
+    drift
+}
+
 fn host_dir(d: &Daemon, label: &str) -> PathBuf {
     d.paths.state().join("hosts").join(label)
 }
@@ -380,7 +407,7 @@ fn one(d: &Arc<Daemon>, who: &str, run: &Run, t: &Target, signer: &swrec::RecSig
             ("security_updates", json!(security_pkgs)),
             ("security_advisories", json!(security.iter().filter_map(|l| l.split('\t').next()).collect::<BTreeSet<_>>().len())),
             ("needs_reboot", json!(reboot)),
-            ("sudoers_drift", json!(sudoers.iter().map(|l| format!("unexpected {}", l.split('\t').next().unwrap_or(""))).collect::<Vec<_>>())),
+            ("sudoers_drift", json!(sudoers_drift(&t.host, &sudoers))),
             ("last_inventory", json!(when)),
         ] {
             facts.insert(k.into(), v);
@@ -511,8 +538,8 @@ pub fn conditions(d: &Daemon, label: &str) -> Vec<crate::table::Condition> {
     if let Some(drift) = f.get("sudoers_drift").and_then(Value::as_array).filter(|a| !a.is_empty()) {
         v.push(Condition {
             kind: "sudoers",
-            summary: "unexpected swrap sudoers files".into(),
-            detail: format!("{label} has sudoers files named swrap-* that swrap did not write: {}. Check who created them.", drift.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", ")),
+            summary: "swrap sudoers files differ from what swuser wrote".into(),
+            detail: format!("{label}: {}. swrap-* files are written by swuser (swuser sudo <host> <account> on|off restores them); check who changed them.", drift.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", ")),
         });
     }
     v
@@ -649,6 +676,26 @@ pub async fn run_loop(d: Arc<Daemon>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sudoers_drift_compares_with_what_swuser_wrote() {
+        use sha2::Digest;
+        let mut h: Host = toml::from_str("label = \"t\"\naddress = \"x\"\nport = 22\nroute = \"core\"\nprofile = \"modern\"\ndefault_user = \"root\"\nstate = \"active\"\n").unwrap();
+        for (n, sudo) in [("ok", "nopasswd"), ("gone", "nopasswd"), ("plain", "none")] {
+            h.accounts.push(swrap_core::config::Account { name: n.into(), key_algo: "ssh-ed25519".into(), key_fingerprint: String::new(), created: String::new(), sudo: sudo.into(), managed_by_swrap: true, integration: true, locked: false });
+        }
+        let hash = |u: &str| format!("{:x}", sha2::Sha256::digest(swrap_core::config::swrap_sudoers(u).as_bytes()))[..16].to_string();
+        let found = vec![
+            format!("/etc/sudoers.d/swrap-ok\t{}", hash("ok")),
+            "/etc/sudoers.d/swrap-plain\t0123456789abcdef".to_string(),
+            "/etc/sudoers.d/swrap-stranger\t0123456789abcdef".to_string(),
+        ];
+        let mut d = sudoers_drift(&h, &found);
+        d.sort();
+        assert_eq!(d, vec!["missing /etc/sudoers.d/swrap-gone", "unexpected /etc/sudoers.d/swrap-plain", "unexpected /etc/sudoers.d/swrap-stranger"]);
+        let modified = vec![format!("/etc/sudoers.d/swrap-ok\t{}", "f".repeat(16)), format!("/etc/sudoers.d/swrap-gone\t{}", hash("gone"))];
+        assert_eq!(sudoers_drift(&h, &modified), vec!["modified /etc/sudoers.d/swrap-ok"]);
+    }
 
     #[test]
     fn installed_kernel_fixes_are_not_pending() {

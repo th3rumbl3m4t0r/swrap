@@ -2,3 +2,6 @@
 /run/swrap(/.*)?	gen_context(system_u:object_r:swrap_var_run_t,s0)
 /usr/libexec/swrap/swrapd	--	gen_context(system_u:object_r:swrapd_exec_t,s0)
 /usr/libexec/swrap/swrap-web	--	gen_context(system_u:object_r:swrap_web_exec_t,s0)
+/usr/libexec/swrap/claude-code(/.*)?	gen_context(system_u:object_r:swrap_ai_exec_t,s0)
+/usr/libexec/swrap/opencode(/.*)?	gen_context(system_u:object_r:swrap_ai_exec_t,s0)
+/var/lib/swrap/ai(/.*)?	gen_context(system_u:object_r:swrap_ai_home_t,s0)

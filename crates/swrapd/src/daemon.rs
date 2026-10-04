@@ -273,6 +273,11 @@ async fn handle(d: Arc<Daemon>, mut s: UnixStream) -> Result<()> {
             tokio::task::spawn_blocking(move || crate::sftp::start(d2, caller, req, std)).await??;
             Ok(())
         }
+        Req::EdgeTunnel { ref id } => {
+            let std = s.into_std()?;
+            std.set_nonblocking(false)?;
+            crate::edge_jobs::open_tunnel(d.swrap_uid, caller.uid, id, std)
+        }
         Req::AiStart { .. } | Req::AiAttach { .. } => {
             let std = s.into_std()?;
             std.set_nonblocking(false)?;
@@ -339,6 +344,6 @@ pub fn dispatch(d: &Arc<Daemon>, c: &Caller, req: Req, con: &Console) -> Result<
         Req::AiAddBackend { addr } => crate::ai::add_backend(d, c, &addr, con),
         Req::AiWorker { session, token, call, args } => crate::ai::worker_call(d, c, &session, &token, &call, &args, con),
         Req::AiList => crate::ai::list(d, c),
-        Req::Sw { .. } | Req::Shell { .. } | Req::AiStart { .. } | Req::AiAttach { .. } | Req::Sftp { .. } => Err(anyhow!("unreachable")),
+        Req::Sw { .. } | Req::Shell { .. } | Req::AiStart { .. } | Req::AiAttach { .. } | Req::Sftp { .. } | Req::EdgeTunnel { .. } => Err(anyhow!("unreachable")),
     }
 }

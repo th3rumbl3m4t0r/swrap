@@ -17,7 +17,7 @@ use nix::pty::{openpty, Winsize};
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 use nix::unistd::Pid;
 use serde_json::{json, Map, Value};
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
@@ -64,6 +64,10 @@ struct Shared {
     models: Mutex<HashSet<String>>,
     stats: Mutex<Stats>,
     agent: ureq::Agent,
+    /// The last tool calls, one line each: the digest a handoff successor gets.
+    recent: Mutex<VecDeque<String>>,
+    /// Set by a successful handoff: the successor, and when; the session ends shortly after.
+    handoff_to: Mutex<Option<(String, Instant)>>,
 }
 
 impl Shared {
@@ -156,6 +160,8 @@ pub fn run(spec: WorkerSpec, client: UnixStream) -> Result<()> {
         models: Mutex::new(HashSet::new()),
         stats: Mutex::new(Stats::default()),
         agent,
+        recent: Mutex::new(VecDeque::new()),
+        handoff_to: Mutex::new(None),
     });
     for (l, which) in [(infer_l, 0), (mcp_l, 1), (tunnel_l, 2)] {
         let sh = sh.clone();
@@ -285,8 +291,13 @@ fn spawn_sandbox(spec: &WorkerSpec, ai: &AiSpec, slave: &OwnedFd) -> Result<Pid>
         let mcp = json!({"mcpServers": {"swrap": {"type": "stdio", "command": "/opt/swai/swrap", "args": ["swai-mcp"]}}}).to_string();
         let what = if ai.mode == "aaa" { "aaa".to_string() } else { format!("{}@{}", ai.ruser, ai.label) };
         let what = if ai.loose { format!("{what} · loose") } else { what };
+        tail.push("/opt/swai/claude/claude".into());
+        if !ai.first_prompt.is_empty() {
+            // A handoff successor starts on its predecessor's briefing. Positional, ahead of
+            // the options (some take several values and would swallow it).
+            tail.push(ai.first_prompt.clone());
+        }
         tail.extend([
-            "/opt/swai/claude/claude".into(),
             // No built-in tools (no shell, files or web): only swrap's.
             "--tools".into(), "".into(),
             "--strict-mcp-config".into(), "--mcp-config".into(), mcp,
@@ -333,6 +344,9 @@ fn spawn_sandbox(spec: &WorkerSpec, ai: &AiSpec, slave: &OwnedFd) -> Result<Pid>
             ("SWAI_PORT", INNER_PORT.to_string()),
         ]);
         tail.push(format!("/opt/swai/opencode/{oc_name}"));
+        if !ai.first_prompt.is_empty() {
+            tail.extend(["--prompt".into(), ai.first_prompt.clone()]);
+        }
         match ai.resume.as_str() {
             "" => {}
             "last" => tail.push("--continue".into()),
@@ -637,6 +651,14 @@ fn relay(sh: &Arc<Shared>, client: UnixStream, master: OwnedFd, pid: Pid, ctl: U
         if detached_at.map(|t| t.elapsed() > detached_max).unwrap_or(false) {
             reason = "detached_timeout".into();
             break;
+        }
+        // After a handoff: a few seconds for the AI's last words, then end; an attached client
+        // follows the successor ("handoff <id>").
+        if let Some((next, at)) = sh.handoff_to.lock().unwrap().clone() {
+            if at.elapsed() > Duration::from_secs(4) {
+                reason = format!("handoff {next}");
+                break;
+            }
         }
         let timeout = PollTimeout::try_from(next_tick.min(Duration::from_millis(200)).as_millis() as i32).unwrap_or(PollTimeout::NONE);
         let (mr, cr, lr) = {
@@ -1429,6 +1451,35 @@ impl Up {
     }
 }
 
+/// One of the backend's `max_concurrent` slots: an flock on `/run/swrap/ai-slots/<backend>.<i>`,
+/// shared by every session's worker and released when the request ends or the worker dies.
+/// Waits up to the backend timeout; `None` when the backend has no limit.
+fn backend_slot(sh: &Shared) -> Result<Option<File>> {
+    let paths = swrap_core::Paths::from_env();
+    let max = swrap_core::config::AiConfig::load(&paths).ok().and_then(|a| a.backend(&sh.ai.backend).map(|b| b.max_concurrent)).unwrap_or(0);
+    take_slot(&paths.run.join("ai-slots"), &sh.ai.backend, max, Duration::from_secs(sh.ai.timeout_secs.max(60)))
+}
+
+fn take_slot(dir: &Path, backend: &str, max: u32, wait: Duration) -> Result<Option<File>> {
+    if max == 0 {
+        return Ok(None);
+    }
+    let _ = std::fs::create_dir(dir);
+    let deadline = Instant::now() + wait;
+    loop {
+        for i in 0..max {
+            let f = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(dir.join(format!("{backend}.{i}")))?;
+            if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                return Ok(Some(f));
+            }
+        }
+        if Instant::now() >= deadline {
+            bail!("backend {backend} is at its limit of {max} requests at once; none finished in time");
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
 fn upstream(sh: &Shared, api: Api, req: &HttpReq, path: &str, body: &[u8], key: Option<&str>, client: &UnixStream) -> Result<Up> {
     let mut hs: Vec<(String, String)> = vec![
         ("content-type".into(), "application/json".into()),
@@ -1592,6 +1643,16 @@ fn infer(sh: &Arc<Shared>, c: &mut UnixStream, req: &HttpReq, api: Api) -> Resul
     sh.stats.lock().unwrap().requests += 1;
     let key = match fetch_key(sh) {
         Ok(k) => k,
+        Err(e) => {
+            let msg = format!("{e:#}");
+            sh.record("a", json!({"n": n, "status": 503, "error": msg}));
+            respond_json(c, 503, &error_body(api, &msg));
+            return Ok(());
+        }
+    };
+    // The backend's max_concurrent (read per request, so `swai backend set` applies at once).
+    let _slot = match backend_slot(sh) {
+        Ok(s) => s,
         Err(e) => {
             let msg = format!("{e:#}");
             sh.record("a", json!({"n": n, "status": 503, "error": msg}));
@@ -2010,11 +2071,41 @@ fn record_output(sh: &Shared, call: &str, fd: u8, data: &[u8]) {
     }
 }
 
+/// `handoff`: costs no budget; swrapd starts the successor, this session ends a few seconds later.
+fn call_handoff(sh: &Shared, args: &Value) -> Value {
+    let call = format!("h{}", sh.tool_no.load(Ordering::SeqCst));
+    if let Some((next, _)) = sh.handoff_to.lock().unwrap().clone() {
+        return tool_text(&format!("already handed off to {next}; this session is ending"), true);
+    }
+    let digest = sh.recent.lock().unwrap().iter().cloned().collect::<Vec<_>>().join("\n");
+    let r = daemon_call(&sh.ai, &sh.spec.id, "handoff", json!({
+        "briefing": args["briefing"], "digest": digest, "cols": sh.spec.cols, "rows": sh.spec.rows, "term": sh.spec.term,
+    }));
+    let (text, is_err) = match r {
+        Ok((resp, _, _)) if resp.ok => {
+            let id = resp.data["id"].as_str().unwrap_or("").to_string();
+            *sh.handoff_to.lock().unwrap() = Some((id.clone(), Instant::now()));
+            sh.note(&format!("handed off to swai session {id}"));
+            (format!(
+                "Handed off: swai session {id} (handoff {} of {}) continues from your briefing with a fresh budget of {} tool calls. This session ends in a few seconds; make no further tool calls.",
+                resp.data["chain"], resp.data["max_handoffs"], resp.data["max_calls"]
+            ), false)
+        }
+        Ok((resp, _, _)) => (format!("handoff refused: {}", resp.error.unwrap_or_default()), true),
+        Err(e) => (format!("handoff failed: swrapd: {e:#}"), true),
+    };
+    sh.record("t", json!({"call": call, "tool": "handoff", "args": args, "error": is_err, "result": text, "started": fmt_utc(swrap_core::time::now())}));
+    tool_text(&text, is_err)
+}
+
 fn call_tool(sh: &Shared, name: &str, args: &Value) -> Value {
+    if name == "handoff" {
+        return call_handoff(sh, args);
+    }
     let n = sh.tool_no.fetch_add(1, Ordering::SeqCst) + 1;
     let call = format!("t{n}");
     if n as usize > sh.ai.max_tool_calls {
-        let msg = format!("tool budget of this session is exhausted ({} calls)", sh.ai.max_tool_calls);
+        let msg = format!("tool budget of this session is exhausted ({} calls): call handoff with a complete briefing; a new session continues with a fresh budget", sh.ai.max_tool_calls);
         sh.record("t", json!({"call": call, "tool": name, "args": args_for_record(name, args), "error": true, "result": msg}));
         sh.note(&msg);
         return tool_text(&msg, true);
@@ -2045,12 +2136,68 @@ fn call_tool(sh: &Shared, name: &str, args: &Value) -> Value {
             st.tool_errors += 1;
         }
     }
+    {
+        let what: String = digest_args(name, args).chars().take(240).collect();
+        let how = match meta["exit"].as_i64() {
+            Some(c) => format!("exit {c}"),
+            None if is_err => format!("error: {}", text.lines().next().unwrap_or("").chars().take(120).collect::<String>()),
+            None => "ok".into(),
+        };
+        let mut r = sh.recent.lock().unwrap();
+        r.push_back(format!("- {call} {name} {what} → {how}"));
+        while r.len() > 40 {
+            r.pop_front();
+        }
+    }
+    let left = sh.ai.max_tool_calls.saturating_sub(n as usize);
+    if sh.ai.handoff_warn > 0 && left <= sh.ai.handoff_warn {
+        let more = if sh.ai.chain >= sh.ai.max_handoffs && sh.ai.max_handoffs > 0 {
+            " No further handoff is possible in this chain: finish what you can and tell the user where things stand.".to_string()
+        } else {
+            " Before it runs out, call handoff with a complete briefing (it costs no budget); a new session continues with a fresh budget.".to_string()
+        };
+        let text = format!("{text}\n\n[swai: {left} tool calls left in this session.{more}]");
+        return tool_text(&text, is_err);
+    }
     tool_text(&text, is_err)
+}
+
+/// What a tool call was about, for the digest.
+fn digest_args(name: &str, args: &Value) -> String {
+    let target = args["target"].as_str().map(|t| format!("{t}: ")).unwrap_or_default();
+    let s = match name {
+        "exec" => format!("`{}`", args["command"].as_str().unwrap_or("").replace('\n', " ⏎ ")),
+        "read_file" | "write_file" | "edit_file" => args["path"].as_str().unwrap_or("").to_string(),
+        "search" => args["query"].as_str().unwrap_or("").to_string(),
+        "transcript" => args["id"].as_str().unwrap_or("").to_string(),
+        _ => String::new(),
+    };
+    format!("{target}{s}")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn backend_slots_cap_requests_across_holders() {
+        let dir = std::env::temp_dir().join(format!("swrap-slots-{}", std::process::id()));
+        let a = take_slot(&dir, "b", 2, Duration::ZERO).unwrap().unwrap();
+        let _b = take_slot(&dir, "b", 2, Duration::ZERO).unwrap().unwrap();
+        assert!(take_slot(&dir, "b", 2, Duration::ZERO).is_err(), "a third request must wait");
+        assert!(take_slot(&dir, "other", 2, Duration::ZERO).unwrap().is_some(), "other backends are separate");
+        drop(a);
+        assert!(take_slot(&dir, "b", 2, Duration::ZERO).unwrap().is_some(), "a finished request frees its slot");
+        assert!(take_slot(&dir, "b", 0, Duration::ZERO).unwrap().is_none(), "0 = no limit");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn digest_lines_name_what_was_done() {
+        assert_eq!(digest_args("exec", &json!({"command": "systemctl restart nginx\nnginx -t"})), "`systemctl restart nginx ⏎ nginx -t`");
+        assert_eq!(digest_args("write_file", &json!({"target": "root@test1", "path": "/etc/x.conf", "content": "…"})), "root@test1: /etc/x.conf");
+        assert_eq!(digest_args("hosts", &json!({})), "");
+    }
 
     #[test]
     fn effort_falls_back_to_nearest_lower() {

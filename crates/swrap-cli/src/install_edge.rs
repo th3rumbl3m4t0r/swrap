@@ -65,6 +65,9 @@ const SSHD_GLOBAL: &str = r#"# managed by swrap (edge). Global options; first va
 LogLevel VERBOSE
 # swrap AAA users, the link user, and root (root keeps key-only login for maintenance and `sw mail`).
 AllowGroups swrap-users swrap-link root
+# SFTP (spec 11): AAA users get the host directories (their session runs on core); root,
+# admins and every other account get sftp-server exactly as before.
+Subsystem sftp /usr/libexec/swrap/sftp-dispatch
 "#;
 
 const SSHD_MATCH: &str = r#"# managed by swrap (edge). Kept last so the Match blocks cannot capture other files' options.
@@ -175,6 +178,10 @@ pub fn main(args: Vec<String>) -> Result<i32> {
     }
     let _ = std::fs::remove_file("/usr/bin/swrec");
     std::os::unix::fs::symlink(Path::new(LIBEXEC).join("swrec"), "/usr/bin/swrec")?;
+    // sshd's sftp subsystem (06-swrap.conf), before sshd is pointed at it.
+    let _ = std::fs::remove_file(Path::new(LIBEXEC).join("sftp-dispatch"));
+    std::os::unix::fs::symlink("swrap", Path::new(LIBEXEC).join("sftp-dispatch"))?;
+    let _ = sh("restorecon", &["-R", LIBEXEC]);
     let shell = format!("{LIBEXEC}/swrap-shell");
     let shells = std::fs::read_to_string("/etc/shells").unwrap_or_default();
     if !shells.lines().any(|l| l == shell) {

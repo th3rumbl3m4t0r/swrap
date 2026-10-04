@@ -106,3 +106,10 @@ pub async fn supervise(d: Arc<Daemon>) {
         backoff = (backoff * 2).min(Duration::from_secs(60));
     }
 }
+
+/// Whether edge is connected now: its Hello rewrites the state file without a `state`, which
+/// the supervisor sets to `connecting` / `down`.
+pub fn is_up(d: &Daemon) -> bool {
+    let st: serde_json::Value = std::fs::read_to_string(crate::edge_api::link_state_path(d)).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+    st.get("up_since").is_some() && !matches!(st["state"].as_str(), Some("down" | "connecting"))
+}

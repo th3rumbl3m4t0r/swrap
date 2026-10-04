@@ -357,6 +357,23 @@ pub struct Account {
     pub managed_by_swrap: bool,
     #[serde(default)]
     pub integration: bool,
+    /// Locked by `swuser lock` (the account has expired: no login, not even with its key).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub locked: bool,
+}
+
+/// `/etc/sudoers.d/swrap-<ruser>` exactly as `swuser` writes it (inventory compares the hash).
+pub fn swrap_sudoers(ruser: &str) -> String {
+    format!("# managed by swrap (swuser): edits are reported as drift\n{ruser} ALL=(ALL) NOPASSWD: ALL\n")
+}
+
+/// A remote user name swuser accepts: a portable lower-case login name, never root.
+pub fn valid_ruser(n: &str) -> bool {
+    n != "root"
+        && !n.is_empty()
+        && n.len() <= 32
+        && n.bytes().next().is_some_and(|b| b.is_ascii_lowercase() || b == b'_')
+        && n.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
 }
 fn sudo_none() -> String { "none".into() }
 
@@ -392,10 +409,24 @@ pub struct Host {
     /// swai may act on this host (spec 24.5: the host must opt in; default false).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub ai_allowed: bool,
+    /// `swai reset` may roll this VM back to its Proxmox snapshot (spec 24.5).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ai_reset: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxmox: Option<ProxmoxVm>,
     /// Free-form progress notes for failed/partial enrollments.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub enroll_progress: Vec<String>,
 }
+/// Where `swai reset` rolls a host back: Proxmox API server, node, VM id and snapshot name.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ProxmoxVm {
+    pub api: String,
+    pub node: String,
+    pub vmid: u32,
+    pub snapshot: String,
+}
+
 fn port22() -> u16 { 22 }
 fn net_core() -> Route { Route::Core }
 fn yes() -> bool { true }
@@ -612,12 +643,16 @@ pub struct AiBackend {
     /// models at high effort can think for many minutes before the first visible output.
     #[serde(default = "ai_timeout")]
     pub timeout: String,
+    /// Requests to this backend at once, over all sessions (0 = no limit); more wait their turn.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub max_concurrent: u32,
     #[serde(default)]
     pub added_by: String,
     #[serde(default)]
     pub created: String,
 }
 fn ai_timeout() -> String { "PT1H".into() }
+fn is_zero_u32(n: &u32) -> bool { *n == 0 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -637,11 +672,19 @@ pub struct AiLimits {
     pub host_context: u64,
     /// A detached session (no client attached) ends after this long.
     pub detached_timeout: String,
+    /// A session that runs out of tool calls hands off to a successor (fresh budget, its
+    /// briefing as the first prompt) at most this many times in a row.
+    pub max_handoffs: usize,
+    /// Tool results remind the AI to hand off when this few calls are left.
+    pub handoff_warn: usize,
+    /// A new session needs this much available memory on core (MiB): each one runs a Claude
+    /// Code or opencode process of several hundred MiB, and core has no swap.
+    pub min_available_mb: u64,
 }
 
 impl Default for AiLimits {
     fn default() -> Self {
-        AiLimits { concurrent_calls: 4, calls_per_hour: 600, max_tool_calls: 500, sessions_per_user: 4, approval: "ask".into(), host_context: 200_000, detached_timeout: "P7D".into() }
+        AiLimits { concurrent_calls: 16, calls_per_hour: 600, max_tool_calls: 500, sessions_per_user: 12, approval: "ask".into(), host_context: 200_000, detached_timeout: "P7D".into(), max_handoffs: 10, handoff_warn: 25, min_available_mb: 1024 }
     }
 }
 
@@ -678,4 +721,21 @@ pub fn load_all_profiles(p: &Paths) -> Result<Vec<Profile>> {
 
 pub fn parse_toml<T: serde::de::DeserializeOwned>(s: &str) -> Result<T> {
     Ok(toml::from_str(s)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn host_with_proxmox_and_accounts_round_trips() {
+        let mut h: Host = toml::from_str("label = \"lab\"\naddress = \"10.0.0.9\"\nport = 22\nroute = \"core\"\nprofile = \"modern\"\ndefault_user = \"root\"\nstate = \"active\"\nai_allowed = true\n").unwrap();
+        h.ai_reset = true;
+        h.proxmox = Some(ProxmoxVm { api: "https://pve.lan:8006".into(), node: "pve".into(), vmid: 120, snapshot: "clean".into() });
+        h.accounts.push(Account { name: "root".into(), key_algo: "ssh-ed25519".into(), key_fingerprint: "SHA256:x".into(), created: "2026-10-03T00:00:00Z".into(), sudo: "none".into(), managed_by_swrap: false, integration: true, locked: false });
+        h.enroll_progress = vec!["step".into()];
+        let back: Host = toml::from_str(&h.to_toml()).unwrap();
+        assert_eq!(back.proxmox, h.proxmox);
+        assert!(back.ai_reset && back.accounts.len() == 1 && back.enroll_progress.len() == 1);
+    }
 }

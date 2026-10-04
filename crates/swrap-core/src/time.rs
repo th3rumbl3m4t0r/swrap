@@ -76,9 +76,14 @@ pub fn zone(name: &str) -> Result<TimeZone, TimeError> {
     Ok(tz)
 }
 
-/// Display format: `2026-09-23T10:14:02+02:00` in the given zone, or `…Z` when `utc`.
+/// UTC by name: always written with `Z`, never `+00:00`.
+fn is_utc_name(z: &str) -> bool {
+    matches!(z, "" | "UTC" | "Etc/UTC" | "Z" | "Zulu" | "Etc/Zulu" | "GMT" | "Etc/GMT" | "Universal" | "Etc/Universal")
+}
+
+/// Display format: `2026-09-23T10:14:02+02:00` in the given zone, or `…Z` when `utc` or the zone is UTC.
 pub fn fmt_display(ts: Timestamp, zone_name: &str, utc: bool) -> String {
-    if utc {
+    if utc || is_utc_name(zone_name) {
         return fmt_utc_secs(ts);
     }
     match zone(zone_name) {
@@ -89,7 +94,7 @@ pub fn fmt_display(ts: Timestamp, zone_name: &str, utc: bool) -> String {
 
 /// Display with fractional seconds (milliseconds) for event listings.
 pub fn fmt_display_ms(ts: Timestamp, zone_name: &str, utc: bool) -> String {
-    if utc {
+    if utc || is_utc_name(zone_name) {
         return ts.strftime("%Y-%m-%dT%H:%M:%S.%3fZ").to_string();
     }
     match zone(zone_name) {
@@ -498,6 +503,14 @@ impl EventClock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn utc_zone_displays_with_z() {
+        let t: Timestamp = "2026-10-03T18:49:30.393Z".parse().unwrap();
+        assert_eq!(fmt_display(t, "UTC", false), "2026-10-03T18:49:30Z");
+        assert_eq!(fmt_display_ms(t, "UTC", false), "2026-10-03T18:49:30.393Z");
+        assert_eq!(fmt_display_ms(t, "Europe/Prague", false), "2026-10-03T20:49:30.393+02:00");
+    }
 
     fn ts(s: &str) -> Timestamp {
         s.parse().unwrap()

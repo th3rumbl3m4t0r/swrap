@@ -34,7 +34,12 @@ pub fn main(args: Vec<String>) -> Result<i32> {
              swai backend list|test <n>  inference backends\n\
              admin: swai backend add <name> <url> [--api openai|anthropic] [--key] | del <name> | key <name>\n       \
              swai grant <user> <hosts> <accounts> [--until ISO] | revoke-grant <user> <id>\n       \
-             swai host <label> on|off    | swai status\n\n\
+             swai host <label> on|off    | swai status | swai limits [<key> <value>]\n       \
+             swai reset <label> [--force]  roll an AI test VM back to its Proxmox snapshot\n       \
+             admin: swai reset-setup <label> --api URL --node N --vmid ID --snapshot S | --off;\n       \
+             swai reset-token <label> (stdin) | swai reset-ca < /etc/pve/pve-root-ca.pem\n\n\
+             Out of tool calls: the AI hands off to a new session (fresh budget) with a briefing;\n\
+             an attached terminal follows it, a detached one keeps running (swai ls).\n\n\
              Everything is recorded: the terminal (with keystrokes), every model request and reply, every tool call."
         );
         return Ok(0);
@@ -56,6 +61,12 @@ pub fn main(args: Vec<String>) -> Result<i32> {
         if !first.starts_with('-') {
             let stdin = if args.len() >= 3 && args[0] == "backend" && args[1] == "key" {
                 Some(term::prompt_secret(&format!("API key for {}: ", args[2]))?.to_string())
+            } else if args.len() >= 2 && args[0] == "reset-token" {
+                Some(term::prompt_secret(&format!("Proxmox API token for {} (user@realm!tokenid=secret): ", args[1]))?.to_string())
+            } else if args[0] == "reset-ca" {
+                let mut s = String::new();
+                std::io::Read::read_to_string(&mut std::io::stdin(), &mut s)?;
+                Some(s)
             } else {
                 None
             };
@@ -175,12 +186,15 @@ fn start(c: Choice, resume: String) -> Result<i32> {
         let _ = write!(out, "\x1b]7719;{n};sw-start:{id}\x07");
         let _ = out.flush();
     }
-    let code = relay(&mut s, &id)?;
+    let end = relay(&mut s, &id)?;
     if let Some(n) = &shell_nonce {
         let _ = write!(out, "\x1b]7719;{n};sw-end:{id}\x07");
         let _ = out.flush();
     }
-    Ok(code)
+    match end {
+        End::Code(code) => Ok(code),
+        End::Follow(next) => attach(next),
+    }
 }
 
 fn attach(id: String) -> Result<i32> {
@@ -214,12 +228,15 @@ fn attach(id: String) -> Result<i32> {
         let _ = write!(out, "\x1b]7719;{n};sw-start:{id}\x07");
         let _ = out.flush();
     }
-    let code = relay(&mut s, &id)?;
+    let end = relay(&mut s, &id)?;
     if let Some(n) = &shell_nonce {
         let _ = write!(out, "\x1b]7719;{n};sw-end:{id}\x07");
         let _ = out.flush();
     }
-    Ok(code)
+    match end {
+        End::Code(code) => Ok(code),
+        End::Follow(next) => attach(next),
+    }
 }
 
 /// Undo what the TUI switched on, for when we leave it running (detach, lost connection).
@@ -228,7 +245,13 @@ const TERM_RESTORE: &str = "\x1b[<u\x1b[<u\x1b[<u\x1b[?1000l\x1b[?1002l\x1b[?100
 /// Ctrl-\ (0x1c) detaches: the session keeps running on core.
 const DETACH_KEY: u8 = 0x1c;
 
-fn relay(s: &mut UnixStream, id: &str) -> Result<i32> {
+/// How a session ended for this client: an exit code, or a handoff to follow.
+enum End {
+    Code(i32),
+    Follow(String),
+}
+
+fn relay(s: &mut UnixStream, id: &str) -> Result<End> {
     use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
     use std::os::fd::{AsFd, BorrowedFd};
     let raw = RawGuard::new();
@@ -236,13 +259,13 @@ fn relay(s: &mut UnixStream, id: &str) -> Result<i32> {
     let mut buf = vec![0u8; 65536];
     let mut rbuf: Vec<u8> = vec![];
     let mut out = std::io::stdout();
-    let detached = |raw: Option<RawGuard>, msg: &str| -> Result<i32> {
+    let detached = |raw: Option<RawGuard>, msg: &str| -> Result<End> {
         let mut o = std::io::stdout();
         let _ = o.write_all(TERM_RESTORE.as_bytes());
         let _ = o.flush();
         drop(raw);
         eprintln!("{msg}");
-        Ok(0)
+        Ok(End::Code(0))
     };
     loop {
         let stdin_fd = unsafe { BorrowedFd::borrow_raw(0) };
@@ -264,7 +287,7 @@ fn relay(s: &mut UnixStream, id: &str) -> Result<i32> {
                 } else {
                     // Our terminal is going away: the session detaches and keeps running.
                     let _ = write_frame(s, &Frame::new(kind::SIGNAL, vec![libc::SIGHUP as u8]));
-                    return Ok(129);
+                    return Ok(End::Code(129));
                 }
             }
         }
@@ -272,7 +295,7 @@ fn relay(s: &mut UnixStream, id: &str) -> Result<i32> {
             let n = unsafe { libc::read(0, buf.as_mut_ptr() as *mut _, buf.len()) };
             if n <= 0 {
                 let _ = write_frame(s, &Frame::new(kind::SIGNAL, vec![libc::SIGHUP as u8]));
-                return Ok(129);
+                return Ok(End::Code(129));
             }
             let data = &buf[..n as usize];
             if let Some(p) = data.iter().position(|&b| b == DETACH_KEY) {
@@ -307,10 +330,18 @@ fn relay(s: &mut UnixStream, id: &str) -> Result<i32> {
                         if reason == "detached" {
                             return detached(raw, &format!("swai: {id} was attached from another terminal"));
                         }
+                        if let Some(next) = reason.strip_prefix("handoff ").filter(|n| !n.is_empty()) {
+                            let mut o = std::io::stdout();
+                            let _ = o.write_all(TERM_RESTORE.as_bytes());
+                            let _ = o.flush();
+                            drop(raw);
+                            eprintln!("swai: session {id} handed off (tool budget used up) · following {next} · replay of this one: swplay {id}");
+                            return Ok(End::Follow(next.to_string()));
+                        }
                         drop(raw);
                         let why = if reason == "exit" { String::new() } else { format!(" ({reason})") };
                         eprintln!("swai: session {id} ended{why} · replay: swplay {id} · continue the conversation: swai -c");
-                        return Ok(code);
+                        return Ok(End::Code(code));
                     }
                     _ => {}
                 }

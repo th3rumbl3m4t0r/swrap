@@ -28,6 +28,7 @@ pub fn run(d: &Arc<Daemon>, c: &Caller, cmd: &str, args: Vec<String>, stdin: Opt
         "doctor" => crate::doctor::run(d, c, &argv[1..], con),
         "table" => crate::table::admin(d, c, &argv, stdin.clone(), con),
         "swadd" | "swenroll" | "swdel" => { c.require_admin().and_then(|_| crate::hosts::run(d, c, cmd, argv, con)) }
+        "swuser" | "swrotate" => crate::accounts::run(d, c, cmd, argv, con),
         _ => bail!("unknown admin command {cmd}"),
     };
     match r {

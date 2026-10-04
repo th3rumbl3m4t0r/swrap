@@ -14,7 +14,7 @@ use swrap_core::Paths;
 const LIBEXEC: &str = "/usr/libexec/swrap";
 const BINARIES: &[&str] = &["swrapd", "swrap", "swrap-shell", "swrap-pam-unlock", "swrec", "swrap-web"];
 const LINKS: &[&str] = &[
-    "swrap", "sw", "swai", "swls", "swlog", "swcat", "swplay", "swsearch", "swupdate", "swinv", "swr", "swx", "swpasswd", "swunlock", "swadm", "swadd", "swenroll", "swdel", "swcrypto", "swfw", "swedge", "swrap-install",
+    "swrap", "sw", "swai", "swls", "swlog", "swcat", "swplay", "swsearch", "swupdate", "swinv", "swr", "swx", "swpasswd", "swunlock", "swadm", "swadd", "swenroll", "swdel", "swuser", "swrotate", "swcrypto", "swfw", "swedge", "swrap-install",
 ];
 
 /// Documentation shipped inside the binary, so every node (and every edge deploy) has it.
@@ -669,6 +669,20 @@ pub fn main(args: Vec<String>) -> Result<i32> {
     if args.first().map(String::as_str) == Some("edge") {
         return crate::install_edge::main(args[1..].to_vec());
     }
+    if args.first().map(String::as_str) == Some("selinux") {
+        // Only the policy module: `--enforce` drops the `swrap:permissive` lines, `--permissive`
+        // (the default) keeps them.
+        if !nix::unistd::geteuid().is_root() {
+            bail!("run as root");
+        }
+        let enforce = match args.get(1).map(String::as_str) {
+            Some("--enforce") => true,
+            None | Some("--permissive") => false,
+            Some(o) => bail!("usage: swrap install selinux [--enforce|--permissive] (got {o})"),
+        };
+        crate::install_selinux::install(enforce)?;
+        return Ok(0);
+    }
     let mut role = None;
     let mut from = None;
     let mut admin_key = None;
@@ -968,7 +982,7 @@ pub fn main(args: Vec<String>) -> Result<i32> {
     println!("    https://{lan_ip}/ — allow your address first: swfw web allow <ip> --for PT8H");
 
     step("SELinux policy for swrap-pam-unlock");
-    crate::install_selinux::install()?;
+    crate::install_selinux::install(crate::install_selinux::installed_mode().as_deref() == Some("enforcing"))?;
 
     step("rebuild kit on both disks (swrap replica sync)");
     match Command::new(format!("{LIBEXEC}/swrap")).args(["replica", "sync"]).status() {

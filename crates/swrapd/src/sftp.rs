@@ -59,9 +59,7 @@ pub fn start(d: Arc<Daemon>, c: Caller, req: Req, mut s: UnixStream) -> Result<(
 fn start_inner(d: &Arc<Daemon>, c: &Caller, req: &Req, s: &UnixStream) -> Result<()> {
     let Req::Sftp { client_addr, conn } = req else { unreachable!() };
     let user = c.aaa()?;
-    if c.origin != Node::Core {
-        bail!("SFTP through the edge is not available yet; connect to the AAA core");
-    }
+    let edge = c.origin == Node::Edge;
     let cfg = d.cfg();
     let live = crate::session::live_sessions(d);
     if live.iter().filter(|j| j["kind"] == "sftp" && j["user"] == c.name.as_str()).count() >= cfg.limits.sessions_per_user {
@@ -78,7 +76,7 @@ fn start_inner(d: &Arc<Daemon>, c: &Caller, req: &Req, s: &UnixStream) -> Result
             }
         }
     }
-    let ents = entries(d, user, Node::Core);
+    let ents = entries(d, user, c.origin);
     let t = now();
     let id = swrap_core::new_id();
     let token = crate::util::random_hex(32);
@@ -87,9 +85,9 @@ fn start_inner(d: &Arc<Daemon>, c: &Caller, req: &Req, s: &UnixStream) -> Result
     let mut header = Map::new();
     header.insert("kind".into(), "sftp".into());
     for (k, v) in [
-        ("origin", json!("core")),
+        ("origin", json!(if edge { "edge" } else { "core" })),
         ("exec", json!("core")),
-        ("delegated", json!(false)),
+        ("delegated", json!(edge)),
         ("aaa_user", json!(c.name)),
         ("client_addr", json!(client_addr)),
         ("conn", json!(conn)),
@@ -121,12 +119,12 @@ fn start_inner(d: &Arc<Daemon>, c: &Caller, req: &Req, s: &UnixStream) -> Result
         ai: None,
         sftp: Some(SftpSpec { token: token.clone(), entries: ents.clone(), idle_secs: 300 }),
     };
-    let reg = |pid: u32| json!({"user": c.name, "token_b3": blake3::hash(token.as_bytes()).to_hex().to_string(), "worker_pid": pid, "started": fmt_utc(t)});
+    let reg = |pid: u32| json!({"user": c.name, "origin": if edge { "edge" } else { "core" }, "token_b3": blake3::hash(token.as_bytes()).to_hex().to_string(), "worker_pid": pid, "started": fmt_utc(t)});
     let rp = reg_dir(d).join(&id);
     swrap_core::atomic::write(&rp, reg(0).to_string().as_bytes(), 0o600, swrap_core::atomic::Owner::new(0, 0))?;
     let pid = crate::session::spawn_worker(d, &spec, s)?;
     swrap_core::atomic::write(&rp, reg(pid).to_string().as_bytes(), 0o600, swrap_core::atomic::Owner::new(0, 0))?;
-    d.audit_event(&c.name, "sftp.start", "core", "", "ok", json!({"client_addr": client_addr, "entries": ents.iter().map(|e| e.name.clone()).collect::<Vec<_>>(), "worker_pid": pid}), &id);
+    d.audit_event(&c.name, "sftp.start", if edge { "edge" } else { "core" }, "", "ok", json!({"client_addr": client_addr, "entries": ents.iter().map(|e| e.name.clone()).collect::<Vec<_>>(), "worker_pid": pid}), &id);
     Ok(())
 }
 
@@ -142,6 +140,8 @@ pub fn backend(d: &Arc<Daemon>, c: &Caller, session: &str, token: &str, entry: &
         bail!("permission denied");
     }
     let who = reg["user"].as_str().unwrap_or("").to_string();
+    // Grants are those of where the user logged in (edge logins see edge_allowed hosts only).
+    let origin = if reg["origin"] == "edge" { Node::Edge } else { Node::Core };
     let user = User::load(&d.paths, &who)?;
     if user.disabled {
         bail!("{who} is disabled");
@@ -154,16 +154,16 @@ pub fn backend(d: &Arc<Daemon>, c: &Caller, session: &str, token: &str, entry: &
     let t = now();
     let ruser = match want {
         Some(r) => r,
-        None => rbac::granted_accounts(&user, &host, Node::Core, t)
+        None => rbac::granted_accounts(&user, &host, origin, t)
             .into_iter()
             .find(|a| crate::session::credential(d, label, a).is_some())
             .ok_or_else(|| anyhow!("no grant for {label} any more"))?,
     };
-    if !rbac::allowed(&user, &host, &ruser, Node::Core, t) {
+    if !rbac::allowed(&user, &host, &ruser, origin, t) {
         bail!("no grant for {ruser}@{label} any more");
     }
-    if host.network == Route::Edge {
-        bail!("{label} is reachable only through edge; SFTP to it is not available yet");
+    if host.network == Route::Edge && !crate::link::is_up(d) {
+        bail!("{label} is reachable only through edge, and the link to edge is down");
     }
     if d.is_sealed() {
         bail!("the swrap vault is sealed; an admin must log in first");
@@ -205,6 +205,13 @@ pub fn backend(d: &Arc<Daemon>, c: &Caller, session: &str, token: &str, entry: &
     crate::session::supervise_agent(d.clone(), sa, sdir.clone(), window, worker);
     let mut argv = crate::session::ssh_argv(profile.ssh_bin_for("core"), &sdir, label);
     argv.extend(["-o".into(), "ServerAliveInterval=30".into(), "-o".into(), "ServerAliveCountMax=4".into(), "-p".into(), host.port.to_string()]);
+    if host.network == Route::Edge {
+        // Only edge reaches this host: ssh still runs here (this agent, hostbound checks, the
+        // pinned keys), its TCP stream goes through edge, which sees only ciphertext.
+        let tid = swrap_core::new_id();
+        crate::edge_jobs::add_tunnel(&tid, &host.address, host.port);
+        argv.extend(["-o".into(), format!("ProxyCommand=/usr/libexec/swrap/swrapd tunnel {tid}")]);
+    }
     argv.extend(["-s".into(), format!("{ruser}@{}", host.address), "sftp".into()]);
     d.audit_event(&who, "sftp.connect", label, &ruser, "ok", json!({"session": session}), &bid);
     Ok(Resp::ok(json!({"argv": argv, "session_dir": sdir, "label": label, "ruser": ruser})))
@@ -911,7 +918,7 @@ impl<'a> Proxy<'a> {
                     let mut p = Pk::new(NAME).u32(id).u32(self.sftp.entries.len() as u32 + 2);
                     let a = dir_attrs(0o755, self.started);
                     let ra = dir_attrs(0o555, self.started);
-                    let date = jiff::Timestamp::from_second(self.started as i64).map(|t| t.to_zoned(jiff::tz::TimeZone::system()).strftime("%b %e %H:%M").to_string()).unwrap_or_default();
+                    let date = jiff::Timestamp::from_second(self.started as i64).map(|t| t.to_zoned(jiff::tz::TimeZone::UTC).strftime("%b %e %H:%M").to_string()).unwrap_or_default();
                     for (n, attrs, mode) in [(".", &ra, "dr-xr-xr-x"), ("..", &ra, "dr-xr-xr-x")] {
                         p = p.str(n.as_bytes()).str(format!("{mode}    2 swrap    swrap           0 {date} {n}").as_bytes()).raw(attrs);
                     }

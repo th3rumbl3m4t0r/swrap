@@ -144,19 +144,32 @@ pub fn selinux_report(detail: bool) -> Vec<String> {
     if mode.is_empty() || mode == "Disabled" {
         return vec!["selinux: disabled".into()];
     }
-    let domains = ["swrapd_t", "swrap_web_t"];
-    let perm = out("semanage", &["permissive", "-l"]);
+    let domains = ["swrapd_t", "swrap_web_t", "swrap_ai_t"];
+    // What the installer loaded (`swrap install selinux [--enforce]`); the newest denial of a
+    // domain says it too (`permissive=1|0`). No semanage: it would need the policy store.
+    let installed = std::fs::read_to_string("/var/lib/swrap/selinux.mode").map(|s| s.trim().to_string()).unwrap_or_else(|_| "permissive".into());
     let running: Vec<String> = out("ps", &["-eo", "label="]).lines().filter_map(|l| l.split(':').nth(2).map(String::from)).collect();
+    let raw = out("ausearch", &["-m", "AVC,USER_AVC", "-ts", "week-ago", "--raw"]);
     let state: Vec<String> = domains
         .iter()
         .map(|t| {
-            let p = if perm.lines().any(|l| l.trim() == *t) { "permissive" } else { "enforced" };
+            let last = raw.lines().rev().find(|l| l.contains("avc:  denied") && l.contains(&format!(":{t}:")));
+            let p = match last {
+                Some(l) if l.contains("permissive=0") => "enforced",
+                Some(_) => "permissive",
+                None if installed == "enforcing" => "enforced",
+                None => "permissive",
+            };
             let n = running.iter().filter(|r| r == t).count();
             format!("{t} {p}, {n} process{}", if n == 1 { "" } else { "es" })
         })
         .collect();
-    let raw = out("ausearch", &["-m", "AVC,USER_AVC", "-ts", "week-ago", "--raw"]);
-    let mine: Vec<&str> = raw.lines().filter(|l| l.contains("avc:  denied") && domains.iter().any(|t| l.contains(&format!(":{t}:")))).collect();
+    // Only what the loaded policy still denies: records after the last `swrap install selinux`
+    // (the mode file's mtime; `msg=audit(<epoch>.<ms>:<serial>)`).
+    let loaded = std::fs::metadata("/var/lib/swrap/selinux.mode").and_then(|m| m.modified()).ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs_f64());
+    let epoch = |l: &str| l.split_once("msg=audit(").and_then(|(_, r)| r.split_once(':')).and_then(|(e, _)| e.parse::<f64>().ok()).unwrap_or(0.0);
+    let since = loaded.and_then(|t| jiff::Timestamp::from_second(t as i64).ok()).map(swrap_core::time::fmt_utc_secs);
+    let mine: Vec<&str> = raw.lines().filter(|l| l.contains("avc:  denied") && domains.iter().any(|t| l.contains(&format!(":{t}:"))) && loaded.is_none_or(|t| epoch(l) >= t)).collect();
     let mut groups: std::collections::BTreeMap<String, u64> = Default::default();
     for l in &mine {
         let field = |k: &str| l.split_whitespace().find_map(|w| w.strip_prefix(k)).unwrap_or("").to_string();
@@ -164,7 +177,11 @@ pub fn selinux_report(detail: bool) -> Vec<String> {
         let perms = l.split_once("{ ").and_then(|(_, r)| r.split_once(" }")).map(|(p, _)| p.to_string()).unwrap_or_default();
         *groups.entry(format!("{} -> {}:{} {{ {perms} }}", ty(field("scontext=")), ty(field("tcontext=")), field("tclass="))).or_default() += 1;
     }
-    let mut v = vec![format!("selinux: {mode}; {}; {} denial{} logged for them in the last P7D ({} kinds)", state.join(", "), mine.len(), if mine.len() == 1 { "" } else { "s" }, groups.len())];
+    let span = match &since {
+        Some(t) => format!("since the policy was loaded ({t}, P7D at most)"),
+        None => "in the last P7D".to_string(),
+    };
+    let mut v = vec![format!("selinux: {mode}; {}; {} denial{} logged for them {span} ({} kinds)", state.join(", "), mine.len(), if mine.len() == 1 { "" } else { "s" }, groups.len())];
     if detail {
         for (k, n) in &groups {
             v.push(format!("  {n:>5}  {k}"));
@@ -232,6 +249,8 @@ pub async fn run_loop(d: Arc<Daemon>) {
         let _ = tokio::task::spawn_blocking(move || {
             let f = check(&d2, scrub, false, &Console::null());
             record(&d2, &f, scrub);
+            // Retired keys (swrotate, swuser del, swdel) are destroyed after P30D (spec 10.4).
+            crate::accounts::purge_retired(&d2);
         })
         .await;
         let new = json!({"run": now, "scrub": if scrub { now } else { last_scrub }});

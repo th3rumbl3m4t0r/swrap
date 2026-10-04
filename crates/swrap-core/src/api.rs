@@ -51,6 +51,9 @@ pub enum Req {
     Sftp { client_addr: String, #[serde(default)] conn: String },
     /// An SFTP worker asks for a host connection for one namespace entry (worker token).
     SftpBackend { session: String, token: String, entry: String },
+    /// swrapd's own `tunnel` helper (ssh ProxyCommand, swrap uid): the connection becomes the TCP
+    /// stream edge opened to a host only it can reach (one use, set up by `SftpBackend`).
+    EdgeTunnel { id: String },
     /// Inventory (spec 10.7): `swinv [targets]` (empty = every host the caller may use).
     Inventory { #[serde(default)] targets: String },
     /// Fleet script (`swr`) or command (`swx`) (spec 10.9). `script` is base64. Secret values
@@ -260,6 +263,17 @@ pub struct AiSpec {
     /// --dangerously-skip-permissions, opencode allows every tool.
     #[serde(default)]
     pub loose: bool,
+    /// A handoff successor's first prompt: the predecessor's briefing (empty otherwise).
+    #[serde(default)]
+    pub first_prompt: String,
+    /// Tool results remind the AI to hand off when this few calls are left.
+    #[serde(default)]
+    pub handoff_warn: usize,
+    /// Place in a handoff chain (0 = started by a user) and its limit.
+    #[serde(default)]
+    pub chain: usize,
+    #[serde(default)]
+    pub max_handoffs: usize,
     /// "" | "last" | an opencode session id (`ses_…`).
     #[serde(default)]
     pub resume: String,
@@ -306,6 +320,9 @@ pub enum EdgeReq {
     Unlock { user: String, password: String, rhost: String },
     /// Edge log lines (journald of swrap units + sshd).
     Log { lines: Vec<String> },
+    /// Long-poll for the inventory tree (`state/`, spec 10.7) newer than commit `have`: DATA
+    /// frames carry its `git archive` (tar.gz), then RESP {head}.
+    State { have: String },
 }
 
 /// Core's answer to `Authorize`.
@@ -342,6 +359,9 @@ pub enum EdgeJob {
     Exec { id: String, plan: EdgeSession, stdin_b64: String, timeout_secs: u64 },
     /// Interactive session started on core for an edge-network host: edge runs and records it.
     Session { id: String, user: String, plan: EdgeSession, cols: u16, rows: u16, term: String },
+    /// A TCP connection to `addr:port` that edge attaches to core with `Attach { id }`: core's own
+    /// ssh runs through it, so edge relays only ciphertext (SFTP to edge-network hosts).
+    Connect { id: String, addr: String, port: u16 },
 }
 
 /// A `--secret-env` value: never shown by `Debug`, so it cannot reach a log by accident.

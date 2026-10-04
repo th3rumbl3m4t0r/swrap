@@ -90,7 +90,18 @@ fn note_usage(d: &Daemon, backend: &str, model: &str) {
     let n = e["n"].as_u64().unwrap_or(0) + 1;
     *e = json!({"last": fmt_utc_secs(now()), "n": n});
     let _ = swrap_core::atomic::mkdirs(&d.paths.state(), 0o750, d.owner());
-    let _ = swrap_core::atomic::write(&p, v.to_string().as_bytes(), 0o640, d.owner());
+    if swrap_core::atomic::write(&p, v.to_string().as_bytes(), 0o640, d.owner()).is_err() {
+        return;
+    }
+    // Versioned like the rest of state/: commit just this file (an inventory may be writing
+    // other files of the repository at the same time). Best effort: a busy index retries next time.
+    let repo = swrap_core::git::Repo::new(d.paths.state()).run_as(d.swrap_uid, d.swrap_gid);
+    if swrap_core::git::is_repo(&d.paths.state()) {
+        let f = "ai-usage.json";
+        if repo.git(&["add", "--", f]).is_ok() && !repo.git_ok(&["diff", "--cached", "--quiet", "--", f]).unwrap_or(true) {
+            let _ = repo.git(&["commit", "-q", "-m", &format!("{} ai usage: {backend} {model}", fmt_utc_secs(now())), "--", f]);
+        }
+    }
 }
 
 /// Models used with `backend` within P30D, most recent first.
@@ -387,7 +398,7 @@ pub fn add_backend(d: &Arc<Daemon>, c: &Caller, addr: &str, con: &Console) -> Re
     for p in &ports {
         let base = format!("http://{host}:{p}");
         con.out(format!("probing {base}/v1/models …"));
-        let probe = AiBackend { name: String::new(), api: AiApi::Openai, base_url: base.clone(), models: vec![], needs_key: false, timeout: "PT1H".into(), added_by: String::new(), created: String::new() };
+        let probe = AiBackend { name: String::new(), api: AiApi::Openai, base_url: base.clone(), models: vec![], needs_key: false, timeout: "PT1H".into(), max_concurrent: 0, added_by: String::new(), created: String::new() };
         if let Ok((200, v)) = get_json(&agent, &format!("{base}/v1/models"), &probe, None) {
             if let Some(a) = v["data"].as_array() {
                 let names: Vec<String> = a.iter().filter_map(|m| m["id"].as_str().map(String::from)).collect();
@@ -404,7 +415,7 @@ pub fn add_backend(d: &Arc<Daemon>, c: &Caller, addr: &str, con: &Console) -> Re
         let _g = d.config_lock.lock().unwrap();
         let mut ai = AiConfig::load(&d.paths)?;
         if ai.backend(&name).is_none() && !ai.backends.iter().any(|b| b.base_url == base) {
-            ai.backends.push(AiBackend { name: name.clone(), api: AiApi::Openai, base_url: base.clone(), models: vec![], needs_key: false, timeout: "PT1H".into(), added_by: c.name.clone(), created: fmt_utc_secs(now()) });
+            ai.backends.push(AiBackend { name: name.clone(), api: AiApi::Openai, base_url: base.clone(), models: vec![], needs_key: false, timeout: "PT1H".into(), max_concurrent: 0, added_by: c.name.clone(), created: fmt_utc_secs(now()) });
             d.write_config("ai.toml", &ai.to_toml())?;
             d.commit(&format!("swai backend {name} added by {}", c.name))?;
         }
@@ -425,6 +436,19 @@ struct Session {
     backend: String,
     max_calls: usize,
     calls: AtomicUsize,
+    /// What a handoff successor starts with (the same as this session).
+    model: String,
+    effort: String,
+    loose: bool,
+    /// Place in a handoff chain (0 = started by the user).
+    chain: usize,
+}
+
+/// A successor started by `handoff`: its first prompt, its predecessor, its place in the chain.
+struct Handoff {
+    prompt: String,
+    continues: String,
+    chain: usize,
 }
 
 fn sessions() -> &'static Mutex<HashMap<String, Arc<Session>>> {
@@ -455,6 +479,10 @@ fn lookup(d: &Daemon, id: &str) -> Option<Arc<Session>> {
         backend: v["backend"].as_str().unwrap_or("").to_string(),
         max_calls: v["max_calls"].as_u64().unwrap_or(500) as usize,
         calls: AtomicUsize::new(v["calls"].as_u64().unwrap_or(0) as usize),
+        model: v["model"].as_str().unwrap_or("").to_string(),
+        effort: v["effort"].as_str().unwrap_or("").to_string(),
+        loose: v["loose"].as_bool().unwrap_or(false),
+        chain: v["chain"].as_u64().unwrap_or(0) as usize,
     });
     sessions().lock().unwrap().insert(id.to_string(), s.clone());
     Some(s)
@@ -480,7 +508,7 @@ fn live_ai(d: &Daemon, user: &str) -> usize {
 }
 
 pub fn start(d: Arc<Daemon>, c: Caller, req: Req, mut s: UnixStream, origin: Node, delegated: bool) -> Result<()> {
-    if let Err(e) = start_inner(&d, &c, &req, &s, origin, delegated) {
+    if let Err(e) = start_inner(&d, &c, &req, &s, origin, delegated, None) {
         let msg = format!("{e:#}");
         let msg = if msg.starts_with("swai:") || msg.starts_with("swrap:") { msg } else { format!("swai: {msg}") };
         let target = match &req {
@@ -612,7 +640,16 @@ fn valid_model(m: &str) -> bool {
     !m.is_empty() && m.len() <= 200 && m.bytes().all(|b| b.is_ascii_alphanumeric() || b"._:/@+-".contains(&b))
 }
 
-fn start_inner(d: &Arc<Daemon>, c: &Caller, req: &Req, s: &UnixStream, origin: Node, delegated: bool) -> Result<()> {
+/// MemAvailable of /proc/meminfo in MiB.
+fn mem_available_mb() -> Option<u64> {
+    let m = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let kb: u64 = m.lines().find_map(|l| l.strip_prefix("MemAvailable:"))?.trim().trim_end_matches("kB").trim().parse().ok()?;
+    Some(kb / 1024)
+}
+
+/// Starts a session for `c` (`s`: the client's connection). A handoff successor has no client
+/// yet (it runs detached until one attaches) and starts from its predecessor's briefing.
+fn start_inner(d: &Arc<Daemon>, c: &Caller, req: &Req, s: &UnixStream, origin: Node, delegated: bool, handoff: Option<&Handoff>) -> Result<String> {
     let Req::AiStart { target, backend, model, effort, cols, rows, term, client_addr, conn, resume, loose } = req else { bail!("not an AI session request") };
     let loose = *loose;
     let resume_ok = resume.is_empty()
@@ -671,7 +708,15 @@ fn start_inner(d: &Arc<Daemon>, c: &Caller, req: &Req, s: &UnixStream, origin: N
         bail!("letting the AI loose (no permission prompts) is for one host, not the whole AAA");
     }
     sweep(d);
-    if live_ai(d, &c.name) >= ai.limits.sessions_per_user {
+    // A successor replaces its predecessor, which ends seconds later: no limit checks.
+    if handoff.is_none() {
+        if let Some(avail) = mem_available_mb() {
+            if avail < ai.limits.min_available_mb {
+                bail!("core is low on memory ({avail} MiB available, a new swai session needs {} MiB); end a session first (swai ls, swai kill <id>)", ai.limits.min_available_mb);
+            }
+        }
+    }
+    if handoff.is_none() && live_ai(d, &c.name) >= ai.limits.sessions_per_user {
         bail!("you already run {} swai sessions (the limit); see them with swai ls, reattach with swai attach, end one with swai kill <id>", ai.limits.sessions_per_user);
     }
     let key = backend_key(d, &b)?;
@@ -691,7 +736,9 @@ fn start_inner(d: &Arc<Daemon>, c: &Caller, req: &Req, s: &UnixStream, origin: N
     std::fs::create_dir(&sock_dir)?;
     std::fs::set_permissions(&sock_dir, std::fs::Permissions::from_mode(0o750))?;
     std::os::unix::fs::chown(&sock_dir, Some(d.swrap_uid), Some(swai_gid))?;
-    let reg = json!({"user": c.name, "token_b3": blake3::hash(token.as_bytes()).to_hex().to_string(), "mode": mode, "label": label, "ruser": ruser, "backend": b.name, "max_calls": ai.limits.max_tool_calls, "started": fmt_utc(t)});
+    let chain = handoff.map(|h| h.chain).unwrap_or(0);
+    let reg = json!({"user": c.name, "token_b3": blake3::hash(token.as_bytes()).to_hex().to_string(), "mode": mode, "label": label, "ruser": ruser, "backend": b.name, "max_calls": ai.limits.max_tool_calls, "started": fmt_utc(t),
+                     "model": model, "effort": effort, "loose": loose, "chain": chain});
     swrap_core::atomic::write(&session_file(d, &id), reg.to_string().as_bytes(), 0o600, swrap_core::atomic::Owner::new(0, 0))?;
     // Persistent homes: opencode per (user, target); Claude Code one per user (it holds the
     // Claude login) with a working directory per target, which keys its conversation history.
@@ -745,6 +792,10 @@ fn start_inner(d: &Arc<Daemon>, c: &Caller, req: &Req, s: &UnixStream, origin: N
     ] {
         header.insert(k.into(), v);
     }
+    if let Some(h) = handoff {
+        header.insert("continues".into(), json!(h.continues));
+        header.insert("chain".into(), json!(h.chain));
+    }
     let cfg = d.cfg();
     let what = if mode == "aaa" { "aaa".to_string() } else { format!("{ruser}@{label}") };
     let mut banner = format!(
@@ -753,6 +804,9 @@ fn start_inner(d: &Arc<Daemon>, c: &Caller, req: &Req, s: &UnixStream, origin: N
         if effort.is_empty() { String::new() } else { format!(" · effort {effort}") },
         fmt_display(t, cfg.tz(), false)
     );
+    if let Some(h) = handoff {
+        banner.push_str(&format!("\r\nswai: handoff {}/{}: continues session {} with a fresh budget of {} tool calls", h.chain, ai.limits.max_handoffs, h.continues, ai.limits.max_tool_calls));
+    }
     if loose {
         banner.push_str(&format!("\r\nswai: LOOSE: no permission prompts{} on {what}; every action is still recorded", if claude { " (--dangerously-skip-permissions)" } else { "" }));
     }
@@ -812,6 +866,10 @@ fn start_inner(d: &Arc<Daemon>, c: &Caller, req: &Req, s: &UnixStream, origin: N
             tz: cfg.tz().to_string(),
             approval: if loose || ai.limits.approval == "allow" { "allow".into() } else { "ask".into() },
             loose,
+            first_prompt: handoff.map(|h| h.prompt.clone()).unwrap_or_default(),
+            handoff_warn: ai.limits.handoff_warn,
+            chain,
+            max_handoffs: ai.limits.max_handoffs,
             resume: resume.clone(),
             detached_secs: IsoDuration::parse(&ai.limits.detached_timeout).ok().and_then(|x| x.exact()).map(|x| x.as_secs()).unwrap_or(7 * 86400),
             harness: if claude { "claude".into() } else { "opencode".into() },
@@ -824,8 +882,8 @@ fn start_inner(d: &Arc<Daemon>, c: &Caller, req: &Req, s: &UnixStream, origin: N
     };
     let pid = crate::session::spawn_worker_ex(d, &spec, s, true)?;
     note_usage(d, &b.name, model);
-    d.audit_event(&c.name, "ai.start", if mode == "aaa" { "aaa" } else { &label }, &ruser, "ok", json!({"backend": b.name, "model": model, "effort": effort, "loose": loose, "origin": origin.as_str(), "delegated": delegated, "client_addr": client_addr, "worker_pid": pid}), &id);
-    Ok(())
+    d.audit_event(&c.name, "ai.start", if mode == "aaa" { "aaa" } else { &label }, &ruser, "ok", json!({"backend": b.name, "model": model, "effort": effort, "loose": loose, "continues": handoff.map(|h| h.continues.as_str()), "chain": chain, "origin": origin.as_str(), "delegated": delegated, "client_addr": client_addr, "worker_pid": pid}), &id);
+    Ok(id)
 }
 
 /// Claude Code asks whether to trust a new working directory; ours are empty per-target
@@ -863,7 +921,10 @@ fn ai_hosts_text(d: &Daemon, user: &User) -> String {
 const GUIDANCE: &str = "Work in small, verifiable steps and check results. Before anything destructive or disruptive \
 (deleting data, stopping or restarting services, upgrades, firewall or network changes, reboots) state exactly what \
 you will do and wait for the user's go-ahead. exec is non-interactive (no TTY): avoid prompts, pagers and editors \
-(use -y, --no-pager, sed or write_file instead). Be concise.";
+(use -y, --no-pager, sed or write_file instead). Be concise. Tool calls per session are limited: when a tool result \
+says few are left (or none), call handoff with a complete briefing. A new session with a fresh budget continues the work \
+from that briefing alone, so put everything in it: the goal, what is done and verified, the current state, what is left, \
+the exact next step, and the paths, commands and findings it needs.";
 
 fn system_prompt(mode: &str, user: &str, host: Option<&Host>, ruser: &str, hosts_list: &str, tz: &str) -> String {
     match host {
@@ -928,6 +989,8 @@ fn tool_defs(mode: &str) -> Value {
                 "replace_all": {"type": "boolean"}
             }), &["path", "old_string", "new_string"])}),
     ];
+    tools.push(json!({"name": "handoff", "description": "Continue in a new swai session with a fresh tool budget, from a briefing you write. Call it when a tool result says the budget is running out or exhausted (it costs no budget). The new session starts with only this briefing and a list of your last tool calls, not this conversation: include the goal, what is done and verified, the current state, what is left, the exact next step, and every path, command, finding and decision it needs. This session ends right after.",
+        "inputSchema": {"type": "object", "properties": {"briefing": {"type": "string", "description": "Everything the next session needs to carry on (plain text or Markdown)."}}, "required": ["briefing"]}}));
     if aaa {
         tools.push(json!({"name": "hosts", "description": "List the hosts and accounts you may act on.", "inputSchema": {"type": "object", "properties": {}}}));
         tools.push(json!({"name": "sessions", "description": "List the user's recordings (kinds sw, shell, ai, sftp) that overlap a time window: start, id, kind, target, status.",
@@ -993,6 +1056,7 @@ pub fn worker_call(d: &Arc<Daemon>, c: &Caller, session: &str, token: &str, op: 
             Ok(Resp::ok(json!({})))
         }
         "tool" => tool_call(d, &s, &user, args, con),
+        "handoff" => handoff(d, &s, &user, args),
         _ => bail!("unknown op {op}"),
     }
 }
@@ -1004,7 +1068,7 @@ fn tool_call(d: &Arc<Daemon>, s: &Session, user: &User, args: &Value, con: &Cons
     // Limits (spec 24.7): per session, per user per hour, per user in flight.
     let n = s.calls.fetch_add(1, Ordering::SeqCst) + 1;
     if n > s.max_calls {
-        return Ok(tool_err(format!("tool budget of this swai session is exhausted ({} calls); start a new session", s.max_calls)));
+        return Ok(tool_err(format!("tool budget of this swai session is exhausted ({} calls): call handoff with a complete briefing; a new session continues with a fresh budget", s.max_calls)));
     }
     let _guard = {
         let mut m = user_calls().lock().unwrap();
@@ -1040,6 +1104,57 @@ fn tool_call(d: &Arc<Daemon>, s: &Session, user: &User, args: &Value, con: &Cons
         }
     }
     Ok(Resp::ok(json!({"text": out.text, "is_error": out.is_error, "target": out.target, "ruser": out.ruser, "exit": out.exit, "dropped": out.dropped, "duration": fmt_duration_ms(dur)})))
+}
+
+/// `handoff` from a session's AI: start its successor (same user, target, account, backend,
+/// model, effort, permissions; fresh budget and conversation) with the briefing and the digest of
+/// its last tool calls as the first prompt. It runs detached; an attached client follows it.
+fn handoff(d: &Arc<Daemon>, s: &Session, user: &User, args: &Value) -> Result<Resp> {
+    let ai = AiConfig::load(&d.paths)?;
+    if s.chain >= ai.limits.max_handoffs {
+        bail!("no further handoff: this session is number {} of at most {} in a row; stop and tell the user where things stand", s.chain, ai.limits.max_handoffs);
+    }
+    let briefing = args["briefing"].as_str().unwrap_or("").trim();
+    if briefing.len() < 200 {
+        bail!("the briefing is too short: the next session gets nothing else, so write the goal, what is done and verified, the current state, what is left, the exact next step, and the paths and commands it needs");
+    }
+    let briefing: String = briefing.chars().take(60_000).collect();
+    let digest: String = args["digest"].as_str().unwrap_or("").chars().take(12_000).collect();
+    let what = if s.mode == "aaa" { "aaa".to_string() } else { format!("{}@{}", s.ruser, s.label) };
+    let chain = s.chain + 1;
+    let prompt = format!(
+        "swai handoff {chain}/{max}: you continue the work of swai session {prev} ({what}), which used up its budget of {calls} tool calls. \
+         You start with a fresh budget and only what follows; that conversation is not available.\n\n\
+         ## Briefing from the previous session\n\n{briefing}\n\n\
+         ## Its last tool calls (from its recording)\n\n{digest}\n\n\
+         Continue the work from here. Where the briefing leaves something essential unclear, check on the host before acting.",
+        max = ai.limits.max_handoffs, prev = s.id, calls = s.max_calls,
+        digest = if digest.trim().is_empty() { "(none recorded)" } else { digest.trim() },
+    );
+    let req = Req::AiStart {
+        target: what.clone(),
+        backend: s.backend.clone(),
+        model: s.model.clone(),
+        effort: s.effort.clone(),
+        cols: args["cols"].as_u64().unwrap_or(120).clamp(20, 1000) as u16,
+        rows: args["rows"].as_u64().unwrap_or(40).clamp(5, 1000) as u16,
+        term: args["term"].as_str().filter(|t| !t.is_empty() && t.len() < 64).unwrap_or("xterm-256color").to_string(),
+        client_addr: "handoff".into(),
+        conn: String::new(),
+        resume: String::new(),
+        loose: s.loose,
+    };
+    let uid = nix::unistd::User::from_name(&s.user).ok().flatten().map(|u| u.uid.as_raw()).unwrap_or(0);
+    let caller = Caller { uid, pid: 0, name: s.user.clone(), user: Some(user.clone()), admin: false, origin: Node::Core };
+    // No client yet: the worker gets one end of a pair whose other end is closed, so it starts
+    // detached (as after ctrl-\) until someone attaches.
+    let (ours, theirs) = UnixStream::pair()?;
+    drop(theirs);
+    let ho = Handoff { prompt, continues: s.id.clone(), chain };
+    let id = start_inner(d, &caller, &req, &ours, Node::Core, false, Some(&ho))?;
+    drop(ours);
+    d.audit_event(&s.user, "ai.handoff", if s.mode == "aaa" { "aaa" } else { &s.label }, &s.ruser, "ok", json!({"from": s.id, "to": id, "chain": chain, "briefing_bytes": briefing.len()}), &s.id);
+    Ok(Resp::ok(json!({"id": id, "chain": chain, "max_handoffs": ai.limits.max_handoffs, "max_calls": ai.limits.max_tool_calls})))
 }
 
 fn summarize(name: &str, a: &Value) -> String {
@@ -1409,6 +1524,32 @@ struct Swai {
 enum Cmd {
     /// Hosts and accounts the AI may use for you.
     Targets,
+    /// Roll an AI test VM back to its Proxmox snapshot (needs an AI grant; the host must allow it).
+    Reset {
+        label: String,
+        /// Also while swai sessions work on it.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Allow swai reset for a host: Proxmox API server, node, VM id, snapshot (admin).
+    ResetSetup {
+        label: String,
+        #[arg(long)]
+        api: Option<String>,
+        #[arg(long)]
+        node: Option<String>,
+        #[arg(long)]
+        vmid: Option<u32>,
+        #[arg(long)]
+        snapshot: Option<String>,
+        /// Turn swai reset off for the host.
+        #[arg(long)]
+        off: bool,
+    },
+    /// The host's Proxmox API token into the vault, from stdin: user@realm!tokenid=secret (admin).
+    ResetToken { label: String },
+    /// The Proxmox CA certificate (/etc/pve/pve-root-ca.pem) from stdin (admin).
+    ResetCa,
     /// Inference backends (admin: add, del, key, test).
     Backend {
         #[command(subcommand)]
@@ -1432,6 +1573,8 @@ enum Cmd {
     Kill { id: String },
     /// Tool approval for exec/write_file/edit_file in new sessions: ask (default) or allow (admin).
     Approval { mode: String },
+    /// Show the limits, or set one: swai limits [<key> <value>] (admin).
+    Limits { key: Option<String>, value: Option<String> },
 }
 
 #[derive(Subcommand, Debug)]
@@ -1452,6 +1595,9 @@ enum BackendCmd {
         /// How long the server may stay silent (plain HTTP) or answer (HTTPS), ISO 8601.
         #[arg(long, default_value = "PT1H")]
         timeout: String,
+        /// Requests at once over all sessions (default: no limit); more wait their turn.
+        #[arg(long)]
+        max_concurrent: Option<u32>,
     },
     /// Change a backend: swai backend set <name> [--timeout PT1H] [--models a,b] (admin).
     Set {
@@ -1461,6 +1607,9 @@ enum BackendCmd {
         /// Model allow-list (comma separated; "" clears it).
         #[arg(long)]
         models: Option<String>,
+        /// Requests at once over all sessions (0 = no limit); applies at once.
+        #[arg(long)]
+        max_concurrent: Option<u32>,
     },
     Del { name: String },
     /// Store the backend's API key in the vault (read from stdin) (admin).
@@ -1472,6 +1621,22 @@ enum BackendCmd {
 pub fn admin(d: &Arc<Daemon>, c: &Caller, argv: &[String], stdin: Option<zeroize::Zeroizing<String>>, con: &Console) -> Result<Resp> {
     let a = Swai::try_parse_from(argv)?;
     match a.cmd {
+        Cmd::Reset { label, force } => crate::ai_reset::reset(d, c, &label, force, con),
+        Cmd::ResetSetup { label, api, node, vmid, snapshot, off } => {
+            let p = if off {
+                None
+            } else {
+                Some(swrap_core::config::ProxmoxVm {
+                    api: api.ok_or_else(|| anyhow!("--api https://<server>:8006 (or --off)"))?.trim_end_matches('/').to_string(),
+                    node: node.ok_or_else(|| anyhow!("--node <proxmox node>"))?,
+                    vmid: vmid.ok_or_else(|| anyhow!("--vmid <id>"))?,
+                    snapshot: snapshot.ok_or_else(|| anyhow!("--snapshot <name>"))?,
+                })
+            };
+            crate::ai_reset::setup(d, c, &label, p)
+        }
+        Cmd::ResetToken { label } => crate::ai_reset::set_token(d, c, &label, stdin),
+        Cmd::ResetCa => crate::ai_reset::set_ca(d, c, stdin),
         Cmd::Targets => {
             let user = ai_user(c)?;
             let t = ai_hosts_text(d, user);
@@ -1508,7 +1673,7 @@ pub fn admin(d: &Arc<Daemon>, c: &Caller, argv: &[String], stdin: Option<zeroize
 fn admin_write(d: &Arc<Daemon>, c: &Caller, cmd: Cmd, stdin: Option<zeroize::Zeroizing<String>>, _con: &Console) -> Result<Resp> {
     let _g = d.config_lock.lock().unwrap();
     match cmd {
-        Cmd::Backend { cmd: BackendCmd::Add { name, base_url, api, key, models, timeout } } => {
+        Cmd::Backend { cmd: BackendCmd::Add { name, base_url, api, key, models, timeout, max_concurrent } } => {
             IsoDuration::parse(&timeout).map_err(|e| anyhow!("--timeout: {e}"))?;
             if !name.bytes().all(|b| b.is_ascii_alphanumeric() || b"._:-".contains(&b)) || name.is_empty() {
                 bail!("bad backend name");
@@ -1527,13 +1692,13 @@ fn admin_write(d: &Arc<Daemon>, c: &Caller, cmd: Cmd, stdin: Option<zeroize::Zer
                 bail!("backend {name} exists");
             }
             let base = base_url.trim_end_matches('/').trim_end_matches("/v1").to_string();
-            ai.backends.push(AiBackend { name: name.clone(), api, base_url: base, models: models.map(|m| m.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect()).unwrap_or_default(), needs_key: key, timeout, added_by: c.name.clone(), created: fmt_utc_secs(now()) });
+            ai.backends.push(AiBackend { name: name.clone(), api, base_url: base, models: models.map(|m| m.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect()).unwrap_or_default(), needs_key: key, timeout, max_concurrent: max_concurrent.unwrap_or(0), added_by: c.name.clone(), created: fmt_utc_secs(now()) });
             d.write_config("ai.toml", &ai.to_toml())?;
             d.commit(&format!("swai backend add {name} by {}", c.name))?;
             d.audit_event(&c.name, "ai.backend.add", &name, "", "ok", json!({"base_url": base_url}), "");
             Ok(Resp::text(format!("backend {name} added{}\n", if key { format!("; now store its key: swai backend key {name}") } else { String::new() })))
         }
-        Cmd::Backend { cmd: BackendCmd::Set { name, timeout, models } } => {
+        Cmd::Backend { cmd: BackendCmd::Set { name, timeout, models, max_concurrent } } => {
             let mut ai = AiConfig::load(&d.paths)?;
             let b = ai.backends.iter_mut().find(|b| b.name == name).ok_or_else(|| anyhow!("unknown backend {name}"))?;
             if let Some(t) = timeout {
@@ -1543,11 +1708,19 @@ fn admin_write(d: &Arc<Daemon>, c: &Caller, cmd: Cmd, stdin: Option<zeroize::Zer
             if let Some(m) = models {
                 b.models = m.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect();
             }
-            let summary = format!("{name}: timeout {}, models {}", b.timeout, if b.models.is_empty() { "any".to_string() } else { b.models.join(",") });
+            if let Some(n) = max_concurrent {
+                b.max_concurrent = n;
+            }
+            let summary = format!(
+                "{name}: timeout {} (new sessions), models {} (new sessions), at once {} (now)",
+                b.timeout,
+                if b.models.is_empty() { "any".to_string() } else { b.models.join(",") },
+                if b.max_concurrent == 0 { "unlimited".to_string() } else { b.max_concurrent.to_string() }
+            );
             d.write_config("ai.toml", &ai.to_toml())?;
             d.commit(&format!("swai backend set {name} by {}", c.name))?;
             d.audit_event(&c.name, "ai.backend.set", &name, "", "ok", json!({}), "");
-            Ok(Resp::text(format!("{summary} (new sessions)\n")))
+            Ok(Resp::text(format!("{summary}\n")))
         }
         Cmd::Backend { cmd: BackendCmd::Del { name } } => {
             let mut ai = AiConfig::load(&d.paths)?;
@@ -1620,6 +1793,49 @@ fn admin_write(d: &Arc<Daemon>, c: &Caller, cmd: Cmd, stdin: Option<zeroize::Zer
             d.audit_event(&c.name, "ai.host", &label, "", "ok", json!({"ai_allowed": on}), "");
             Ok(Resp::text(format!("{label}: AI {}\n", if on { "enabled (users still need an AI grant)" } else { "disabled" })))
         }
+        Cmd::Limits { key: None, .. } => {
+            let l = AiConfig::load(&d.paths)?.limits;
+            Ok(Resp::text(format!(
+                "max_tool_calls    {:>8}  tool calls per session\n\
+                 handoff_warn      {:>8}  tool results remind the AI to hand off when this few are left\n\
+                 max_handoffs      {:>8}  handoffs in a row (each successor gets a fresh max_tool_calls)\n\
+                 calls_per_hour    {:>8}  tool calls per user per PT1H\n\
+                 concurrent_calls  {:>8}  tool calls per user at once\n\
+                 sessions_per_user {:>8}  running sessions per user\n\
+                 min_available_mb  {:>8}  a new session needs this much available memory on core (MiB)\n\
+                 host_context      {:>8}  context cap (tokens) for one-host sessions\n\
+                 detached_timeout  {:>8}  a session without a client ends after this\n",
+                l.max_tool_calls, l.handoff_warn, l.max_handoffs, l.calls_per_hour, l.concurrent_calls, l.sessions_per_user, l.min_available_mb, l.host_context, l.detached_timeout
+            )))
+        }
+        Cmd::Limits { key: Some(key), value } => {
+            let value = value.ok_or_else(|| anyhow!("usage: swai limits <key> <value>"))?;
+            let mut ai = AiConfig::load(&d.paths)?;
+            let l = &mut ai.limits;
+            let num = || value.parse::<u64>().map_err(|_| anyhow!("{key} takes a whole number"));
+            match key.as_str() {
+                "max_tool_calls" => l.max_tool_calls = (num()? as usize).max(1),
+                "handoff_warn" => l.handoff_warn = num()? as usize,
+                "max_handoffs" => l.max_handoffs = num()? as usize,
+                "calls_per_hour" => l.calls_per_hour = (num()? as usize).max(1),
+                "concurrent_calls" => l.concurrent_calls = (num()? as usize).max(1),
+                "sessions_per_user" => l.sessions_per_user = (num()? as usize).max(1),
+                "host_context" => l.host_context = num()?,
+                "min_available_mb" => l.min_available_mb = num()?,
+                "detached_timeout" => {
+                    IsoDuration::parse(&value).ok().and_then(|x| x.exact()).ok_or_else(|| anyhow!("detached_timeout is an ISO 8601 duration, e.g. P7D"))?;
+                    l.detached_timeout = value.clone();
+                }
+                k => bail!("unknown limit {k} (see swai limits)"),
+            }
+            d.write_config("ai.toml", &ai.to_toml())?;
+            d.commit(&format!("swai limits {key} {value} by {}", c.name))?;
+            d.audit_event(&c.name, "ai.limits", &key, "", "ok", json!({"value": value}), "");
+            // Read on every tool call or start: running sessions get it now. The others are part of
+            // a session's spec from its start.
+            let now = matches!(key.as_str(), "concurrent_calls" | "calls_per_hour" | "max_handoffs" | "sessions_per_user" | "min_available_mb");
+            Ok(Resp::text(format!("{key} = {value} ({})\n", if now { "in effect now, also for running sessions" } else { "for new sessions" })))
+        }
         Cmd::Approval { mode } => {
             if mode != "ask" && mode != "allow" {
                 bail!("approval is ask or allow");
@@ -1657,6 +1873,22 @@ fn admin_write(d: &Arc<Daemon>, c: &Caller, cmd: Cmd, stdin: Option<zeroize::Zer
             }
             Ok(Resp::text(s))
         }
-        Cmd::Targets | Cmd::Kill { .. } | Cmd::Backend { cmd: BackendCmd::List } | Cmd::Backend { cmd: BackendCmd::Test { .. } } => unreachable!(),
+        Cmd::Targets | Cmd::Reset { .. } | Cmd::ResetSetup { .. } | Cmd::ResetToken { .. } | Cmd::ResetCa | Cmd::Kill { .. } | Cmd::Backend { cmd: BackendCmd::List } | Cmd::Backend { cmd: BackendCmd::Test { .. } } => unreachable!(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn handoff_is_offered_in_both_modes_and_explained() {
+        for mode in ["host", "aaa"] {
+            let defs = tool_defs(mode);
+            let h = defs.as_array().unwrap().iter().find(|t| t["name"] == "handoff").expect("handoff tool");
+            assert_eq!(h["inputSchema"]["required"], json!(["briefing"]));
+            assert!(h["description"].as_str().unwrap().contains("costs no budget"));
+        }
+        assert!(GUIDANCE.contains("call handoff with a complete briefing"));
     }
 }

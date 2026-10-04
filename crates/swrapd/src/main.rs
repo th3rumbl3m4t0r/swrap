@@ -1,8 +1,10 @@
 //! swrapd: the core daemon (vault, RBAC, sessions, agent proxy, records, retention).
 
+mod accounts;
 mod admin;
 mod agent;
 mod ai;
+mod ai_reset;
 mod ai_worker;
 mod audit;
 mod crypto;
@@ -39,6 +41,7 @@ fn main() -> Result<()> {
     match args.get(1).map(String::as_str) {
         Some("worker") => worker::main(),
         Some("edge") => edged::main(),
+        Some("tunnel") => tunnel(args.get(2).map(String::as_str).unwrap_or("")),
         Some("profile-snippet") => {
             print!("{}", hosts::profile_snippet());
             Ok(())
@@ -46,6 +49,39 @@ fn main() -> Result<()> {
         None | Some("run") => run(),
         Some(o) => anyhow::bail!("unknown mode {o}; usage: swrapd [run]"),
     }
+}
+
+/// `swrapd tunnel <id>`: ssh's ProxyCommand for hosts only edge reaches (SFTP backends). Asks
+/// swrapd for the tunnel, then relays stdin/stdout to it.
+fn tunnel(id: &str) -> Result<()> {
+    use std::io::{Read, Write};
+    use swrap_core::frame::{kind, read_frame, write_frame, Frame};
+    let mut s = std::os::unix::net::UnixStream::connect(Paths::from_env().api_sock()).context("swrapd")?;
+    write_frame(&mut s, &Frame::json(kind::REQ, &swrap_core::api::Req::EdgeTunnel { id: id.to_string() }))?;
+    let r: swrap_core::api::Resp = read_frame(&mut s)?.context("swrapd closed")?.parse()?;
+    if !r.ok {
+        anyhow::bail!("swrap tunnel: {}", r.error.unwrap_or_default());
+    }
+    let mut up = s.try_clone()?;
+    let t = std::thread::spawn(move || {
+        let mut buf = [0u8; 64 << 10];
+        let mut stdin = std::io::stdin().lock();
+        while let Ok(n) = stdin.read(&mut buf) {
+            if n == 0 || up.write_all(&buf[..n]).is_err() {
+                break;
+            }
+        }
+        let _ = up.shutdown(std::net::Shutdown::Write);
+    });
+    let mut out = std::io::stdout().lock();
+    let mut buf = [0u8; 64 << 10];
+    while let Ok(n) = s.read(&mut buf) {
+        if n == 0 || out.write_all(&buf[..n]).and_then(|_| out.flush()).is_err() {
+            break;
+        }
+    }
+    drop(t);
+    Ok(())
 }
 
 fn prepare_run_dirs(p: &Paths, uid: u32, gid: u32) -> Result<()> {
@@ -56,6 +92,7 @@ fn prepare_run_dirs(p: &Paths, uid: u32, gid: u32) -> Result<()> {
         (p.run.join("agents"), 0o700, false),
         (p.run.join("keygen"), 0o700, false),
         (p.run.join("caps"), 0o700, false),
+        (p.run.join("ai-slots"), 0o700, true),
     ] {
         std::fs::create_dir_all(&dir)?;
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode))?;

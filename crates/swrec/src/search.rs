@@ -35,6 +35,8 @@ pub enum Field {
     Prompt,
     Reply,
     Tool,
+    /// swai: tool arguments (`args:`), each as `key=value`.
+    Args,
     Free,
 }
 
@@ -53,6 +55,7 @@ impl Field {
             "prompt" => Field::Prompt,
             "reply" => Field::Reply,
             "tool" => Field::Tool,
+            "args" => Field::Args,
             _ => return None,
         })
     }
@@ -70,6 +73,7 @@ impl Field {
             Field::Prompt => "prompt",
             Field::Reply => "reply",
             Field::Tool => "tool",
+            Field::Args => "args",
             Field::Free => "text",
         }
     }
@@ -277,8 +281,7 @@ pub fn candidates(root: &Path, users: Option<&[String]>, kinds: &[String], windo
     let start_date = window.start.to_zoned(jiff::tz::TimeZone::UTC).date();
     let end_date = window.end.to_zoned(jiff::tz::TimeZone::UTC).date();
     let rec = root.join("rec");
-    let Ok(ud) = std::fs::read_dir(&rec) else { return out };
-    for u in ud.flatten() {
+    for u in std::fs::read_dir(&rec).into_iter().flatten().flatten() {
         let user = u.file_name().to_string_lossy().to_string();
         if let Some(us) = users {
             if !us.iter().any(|x| x == &user) {
@@ -294,12 +297,29 @@ pub fn candidates(root: &Path, users: Option<&[String]>, kinds: &[String], windo
             });
         }
     }
-    if users.is_none() && (kinds.is_empty() || kinds.iter().any(|k| k == "run")) {
+    if kinds.is_empty() || kinds.iter().any(|k| k == "run") {
+        // Fleet runs live outside the per-user tree; each run's meta.toml names who started it
+        // (`who`), so a user finds their own runs and an admin everyone's.
+        let mut owner: std::collections::HashMap<PathBuf, String> = Default::default();
         walk_dated(&root.join("runs"), start_date, end_date, window, &mut |p| {
-            out.push(Candidate { path: p, user: String::new(), kind: "run".into() })
+            let dir = p.parent().map(Path::to_path_buf).unwrap_or_default();
+            let who = owner.entry(dir.clone()).or_insert_with(|| run_owner(&dir)).clone();
+            if users.is_none_or(|us| us.iter().any(|x| x == &who)) {
+                out.push(Candidate { path: p, user: who, kind: "run".into() })
+            }
         });
     }
     out
+}
+
+/// `who` from a run directory's meta.toml ("" when unreadable: then only admins see it).
+fn run_owner(dir: &Path) -> String {
+    let t = std::fs::read_to_string(dir.join("meta.toml")).unwrap_or_default();
+    // A top-level `who = "<name>"` (names are plain: no quotes or escapes to decode).
+    t.lines()
+        .take_while(|l| !l.starts_with('['))
+        .find_map(|l| l.strip_prefix("who = \"").and_then(|r| r.strip_suffix('"')).map(String::from))
+        .unwrap_or_default()
 }
 
 fn walk_dated(base: &Path, sd: jiff::civil::Date, ed: jiff::civil::Date, window: &Interval, f: &mut dyn FnMut(PathBuf)) {
@@ -466,12 +486,14 @@ pub fn scan_file(c: &Candidate, q: &Query, window: &Interval, per_file_max: usiz
     }
     let need = |f: Field| content.iter().any(|t| t.field == f || t.field == Field::Free);
     let (mut out, mut keys, mut cmd, mut file) = (Stream::new(), Stream::new(), Stream::new(), Stream::new());
-    let (mut prompt, mut reply, mut tool) = (Stream::new(), Stream::new(), Stream::new());
+    let (mut prompt, mut reply, mut tool, mut args_s) = (Stream::new(), Stream::new(), Stream::new(), Stream::new());
     let mut strip = AnsiStripper::default();
     let mut strip_tool = AnsiStripper::default();
     let mut kr = KeyRenderer::default();
     let (n_out, n_keys, n_cmd, n_file) = (need(Field::Out), need(Field::Keys), need(Field::Cmd), need(Field::File));
     let (n_prompt, n_reply, n_tool) = (need(Field::Prompt), need(Field::Reply), need(Field::Tool));
+    // Free text finds arguments through `tool` already.
+    let n_args = content.iter().any(|t| t.field == Field::Args);
     let mut bytes = 0u64;
     let _ = for_each_raw_line(&c.path, |l| {
         bytes += l.bytes.len() as u64 + 1;
@@ -497,8 +519,25 @@ pub fn scan_file(c: &Candidate, q: &Query, window: &Interval, per_file_max: usiz
                     s.text.push('\n');
                 }
             }
-            "t" if (n_tool || n_cmd) && in_window => {
+            "t" if (n_tool || n_cmd || n_args) && in_window => {
                 let args = m.get("args").cloned().unwrap_or(Value::Null);
+                if n_args {
+                    args_s.mark(ts);
+                    match &args {
+                        Value::Object(o) => {
+                            for (k, v) in o {
+                                args_s.text.push_str(k);
+                                args_s.text.push('=');
+                                args_s.text.push_str(&v.as_str().map(String::from).unwrap_or_else(|| v.to_string()));
+                                args_s.text.push('\n');
+                            }
+                        }
+                        other => {
+                            args_s.text.push_str(&other.to_string());
+                            args_s.text.push('\n');
+                        }
+                    }
+                }
                 if n_tool {
                     tool.mark(ts);
                     tool.text.push_str(m.get("tool").and_then(Value::as_str).unwrap_or(""));
@@ -568,6 +607,7 @@ pub fn scan_file(c: &Candidate, q: &Query, window: &Interval, per_file_max: usiz
             Field::Prompt => vec![("prompt", &prompt)],
             Field::Reply => vec![("reply", &reply)],
             Field::Tool => vec![("tool", &tool)],
+            Field::Args => vec![("args", &args_s)],
             _ => vec![("prompt", &prompt), ("reply", &reply), ("tool", &tool), ("cmd", &cmd), ("out", &out), ("keys", &keys), ("file", &file), ("header", &hdr)],
         };
         let mut found = false;
@@ -673,9 +713,9 @@ pub fn find_record(root: &Path, users: Option<&[String]>, id: &str) -> Option<Pa
             }
         }
     }
-    if users.is_none() {
-        dirs.push(root.join("runs"));
-    }
+    // Fleet runs: everyone's for admins, a user's own otherwise (meta.toml `who`).
+    let runs = root.join("runs");
+    dirs.push(runs.clone());
     let date = ulid::Ulid::from_string(id).ok().map(|u| {
         let ms = u.timestamp_ms();
         let t = jiff::Timestamp::from_millisecond(ms as i64).unwrap_or(jiff::Timestamp::UNIX_EPOCH);
@@ -688,6 +728,16 @@ pub fn find_record(root: &Path, users: Option<&[String]>, id: &str) -> Option<Pa
         };
         for dir in search_dirs {
             if let Some(p) = scan_dir_for(&dir, id) {
+                if base == runs {
+                    if let Some(us) = users {
+                        // A run's id names its directory; a host file's parent is that directory.
+                        let rd = if p.is_dir() { p.clone() } else { p.parent().unwrap_or(&dir).to_path_buf() };
+                        let who = run_owner(&rd);
+                        if !us.iter().any(|u| u == &who) {
+                            continue;
+                        }
+                    }
+                }
                 return Some(p);
             }
         }
@@ -735,6 +785,26 @@ fn scan_dir_for(dir: &Path, id: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn users_find_their_own_runs_only() {
+        let root = std::env::temp_dir().join(format!("swrap-runs-{}", std::process::id()));
+        let id = "01M41KP31JSNBW3W7NV2M5WV63";
+        let dir = root.join("runs/2026/10/03").join(format!("20261003T192603Z_{id}_swr"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("meta.toml"), "id = \"x\"\nwho = \"alice\"\n\n[extra]\nwho = \"mallory\"\n").unwrap();
+        std::fs::write(dir.join("web1.swrec"), "").unwrap();
+        assert_eq!(run_owner(&dir), "alice");
+        let alice = vec!["alice".to_string()];
+        let bob = vec!["bob".to_string()];
+        assert!(find_record(&root, Some(&alice), id).is_some());
+        assert!(find_record(&root, Some(&bob), id).is_none());
+        assert!(find_record(&root, None, id).is_some());
+        let w = Interval::parse("2026-10-03T00:00:00Z/2026-10-04T00:00:00Z").unwrap();
+        assert_eq!(candidates(&root, Some(&alice), &[], &w).len(), 1);
+        assert_eq!(candidates(&root, Some(&bob), &[], &w).len(), 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
     #[test]
     fn parse_query() {
         let q = Query::parse(r#"window:P7D/now host:web* cmd:/dnf .*install/ out:"permission denied" -ruser:deploy hello"#).unwrap();

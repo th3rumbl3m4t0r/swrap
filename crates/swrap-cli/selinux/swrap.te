@@ -1,4 +1,4 @@
-policy_module(swrap, 1.2.1)
+policy_module(swrap, 1.3.2)
 
 ########################################
 # swrap on core. sshd runs the pam_exec helper (swrap-pam-unlock) in its session domain;
@@ -16,18 +16,20 @@ require {
 # get their own domains, PERMISSIVE for now: nothing is denied, and everything enforcement
 # would deny is logged (permissive=1). `swrap doctor --selinux` summarises those denials and
 # drafts the rules; once they are in, the `permissive` lines go and the domains are enforced.
+# 1.3.0 (2026-10-03): rules drafted from P7D of logged denials are in (below); the lines marked
+# `swrap:permissive` are dropped by `swrap install selinux --enforce`.
 
 type swrapd_t;
 type swrapd_exec_t;
 init_daemon_domain(swrapd_t, swrapd_exec_t)
-permissive swrapd_t;
+permissive swrapd_t; # swrap:permissive
 
 type swrap_web_t;
 type swrap_web_exec_t;
 init_daemon_domain(swrap_web_t, swrap_web_exec_t)
 # The unit sets NoNewPrivileges=yes: systemd may still enter the domain.
 init_nnp_daemon_domain(swrap_web_t)
-permissive swrap_web_t;
+permissive swrap_web_t; # swrap:permissive
 
 # Enforcing neighbours that talk to the daemon need their rules now, not later: the sshd PAM
 # helper connects to swrapd's unseal socket (the rule for unconfined_service_t stays while
@@ -52,3 +54,256 @@ allow sshd_session_t unconfined_service_t:unix_stream_socket connectto;
 
 allow sshd_t swrap_var_run_t:dir search_dir_perms;
 allow sshd_t swrap_var_run_t:file read_file_perms;
+
+########################################
+# swrap_ai_t: the AI harness (Claude Code, opencode) inside its bwrap sandbox. Entered when bwrap,
+# still in swrapd_t and with no_new_privs set, executes a harness binary. It gets the sandbox's
+# own loopback (where the recording proxy's relay listens) and nothing else on the network, its
+# home (/var/lib/swrap/ai), its sockets to the session worker, and no vault, keyring or other
+# swrap data.
+
+type swrap_ai_t;
+type swrap_ai_exec_t;
+type swrap_ai_home_t;
+files_type(swrap_ai_home_t)
+domain_type(swrap_ai_t)
+domain_entry_file(swrap_ai_t, swrap_ai_exec_t)
+role system_r types swrap_ai_t;
+domain_auto_transition_pattern(swrapd_t, swrap_ai_exec_t, swrap_ai_t)
+allow swrapd_t swrap_ai_t:process2 nnp_transition;
+permissive swrap_ai_t; # swrap:permissive
+
+allow swrap_ai_t self:process { execmem getattr getpgid getsched setpgid setsched signal_perms };
+allow swrap_ai_t self:fifo_file rw_fifo_file_perms;
+allow swrap_ai_t self:unix_stream_socket { create_stream_socket_perms connectto };
+allow swrap_ai_t self:unix_dgram_socket create_socket_perms;
+allow swrap_ai_t self:tcp_socket create_stream_socket_perms;
+allow swrap_ai_t self:udp_socket create_socket_perms;
+corenet_tcp_connect_all_unreserved_ports(swrap_ai_t)
+corenet_tcp_connect_http_port(swrap_ai_t)
+
+allow swrap_ai_t swrap_ai_exec_t:dir list_dir_perms;
+allow swrap_ai_t swrap_ai_exec_t:file { mmap_exec_file_perms ioctl lock };
+allow swrap_ai_t swrap_ai_exec_t:lnk_file read_lnk_file_perms;
+corecmd_exec_bin(swrap_ai_t)
+corecmd_exec_shell(swrap_ai_t)
+libs_use_ld_so(swrap_ai_t)
+libs_use_shared_libs(swrap_ai_t)
+files_read_etc_files(swrap_ai_t)
+files_search_var_lib(swrap_ai_t)
+miscfiles_read_localization(swrap_ai_t)
+miscfiles_read_generic_certs(swrap_ai_t)
+kernel_read_system_state(swrap_ai_t)
+kernel_read_kernel_sysctls(swrap_ai_t)
+kernel_read_vm_sysctls(swrap_ai_t)
+kernel_getattr_core_if(swrap_ai_t)
+dev_read_rand(swrap_ai_t)
+dev_read_urand(swrap_ai_t)
+dev_rw_null(swrap_ai_t)
+term_use_generic_ptys(swrap_ai_t)
+term_use_ptmx(swrap_ai_t)
+
+# The sandbox's /tmp and /dev (tmpfs), with inotify.
+fs_manage_tmpfs_dirs(swrap_ai_t)
+fs_manage_tmpfs_files(swrap_ai_t)
+fs_manage_tmpfs_symlinks(swrap_ai_t)
+fs_manage_tmpfs_sockets(swrap_ai_t)
+allow swrap_ai_t tmpfs_t:dir watch;
+allow swrap_ai_t tmpfs_t:file watch;
+
+# Its home.
+manage_dirs_pattern(swrap_ai_t, swrap_ai_home_t, swrap_ai_home_t)
+manage_files_pattern(swrap_ai_t, swrap_ai_home_t, swrap_ai_home_t)
+manage_lnk_files_pattern(swrap_ai_t, swrap_ai_home_t, swrap_ai_home_t)
+manage_sock_files_pattern(swrap_ai_t, swrap_ai_home_t, swrap_ai_home_t)
+allow swrap_ai_t swrap_ai_home_t:dir watch;
+allow swrap_ai_t swrap_ai_home_t:file watch;
+
+# The session worker: inherited descriptors and terminal, its sockets (/swai), signals both ways.
+allow swrap_ai_t swrapd_t:fd use;
+allow swrap_ai_t swrapd_t:fifo_file rw_fifo_file_perms;
+allow swrap_ai_t swrapd_t:unix_stream_socket { connectto rw_socket_perms };
+allow swrap_ai_t swrapd_t:process sigchld;
+allow swrap_ai_t swrap_var_run_t:dir search_dir_perms;
+allow swrap_ai_t swrap_var_run_t:sock_file write_sock_file_perms;
+allow swrapd_t swrap_ai_t:process { signal_perms getattr };
+
+# swrapd prepares and cleans the homes.
+manage_dirs_pattern(swrapd_t, swrap_ai_home_t, swrap_ai_home_t)
+manage_files_pattern(swrapd_t, swrap_ai_home_t, swrap_ai_home_t)
+manage_lnk_files_pattern(swrapd_t, swrap_ai_home_t, swrap_ai_home_t)
+manage_sock_files_pattern(swrapd_t, swrap_ai_home_t, swrap_ai_home_t)
+allow swrapd_t swrap_ai_home_t:dir { relabelfrom relabelto mounton };
+allow swrapd_t swrap_ai_home_t:file { relabelfrom relabelto mounton };
+
+########################################
+# swrapd_t, drafted from the denials logged while permissive (P7D up to 2026-10-03):
+# daemon, session workers, fleet jobs, inventory, firewall, doctor, link, edge, swai workers.
+
+require {
+    type tmp_t;
+    type tmpfs_t;
+    type cgroup_t;
+    type home_bin_t;
+    type ssh_exec_t;
+    type ssh_agent_exec_t;
+    type ssh_keygen_exec_t;
+    type sshd_keygen_exec_t;
+    type sshd_keygen_unit_file_t;
+    type sshd_session_exec_t;
+    type ifconfig_exec_t;
+    type swrap_web_exec_t;
+    type unconfined_service_t;
+}
+
+# Processes it watches (sessions, workers, agents, ps and /proc scans): read-only.
+domain_read_all_domains_state(swrapd_t)
+domain_getattr_all_domains(swrapd_t)
+allow swrapd_t unconfined_service_t:process signull;
+allow swrapd_t unconfined_service_t:key read;
+
+allow swrapd_t self:capability { chown dac_override dac_read_search fowner fsetid kill setgid setuid sys_ptrace net_admin net_bind_service };
+allow swrapd_t self:cap_userns { dac_override net_admin setpcap sys_admin sys_ptrace };
+allow swrapd_t self:process { execmem getattr setcap setpgid signal_perms };
+allow swrapd_t self:key { read setattr write view search };
+allow swrapd_t self:user_namespace create;
+allow swrapd_t self:fifo_file rw_fifo_file_perms;
+allow swrapd_t self:unix_stream_socket { create_stream_socket_perms connectto };
+allow swrapd_t self:unix_dgram_socket { create_socket_perms ioctl };
+allow swrapd_t self:tcp_socket create_stream_socket_perms;
+allow swrapd_t self:udp_socket create_socket_perms;
+allow swrapd_t self:netlink_route_socket { create_netlink_socket_perms nlmsg_read nlmsg_write };
+allow swrapd_t self:netlink_netfilter_socket create_socket_perms;
+allow swrapd_t self:netlink_audit_socket create;
+
+# Its own data, the vault, run files and sockets.
+files_manage_var_lib_dirs(swrapd_t)
+files_manage_var_lib_files(swrapd_t)
+files_map_var_lib_files(swrapd_t)
+files_read_var_files(swrapd_t)
+files_list_var(swrapd_t)
+manage_dirs_pattern(swrapd_t, swrap_vault_t, swrap_vault_t)
+manage_files_pattern(swrapd_t, swrap_vault_t, swrap_vault_t)
+manage_dirs_pattern(swrapd_t, swrap_var_run_t, swrap_var_run_t)
+manage_files_pattern(swrapd_t, swrap_var_run_t, swrap_var_run_t)
+manage_sock_files_pattern(swrapd_t, swrap_var_run_t, swrap_var_run_t)
+files_pid_filetrans(swrapd_t, swrap_var_run_t, dir)
+
+# Programs it runs in its own domain: ssh, ssh-agent, ssh-keygen, git, nft, tar, rpm (core's own
+# inventory), python3 (endpoint agent provisioning), ausearch (doctor), itself (workers).
+can_exec(swrapd_t, swrapd_exec_t)
+corecmd_exec_bin(swrapd_t)
+corecmd_exec_shell(swrapd_t)
+corecmd_mmap_bin_files(swrapd_t)
+ssh_exec(swrapd_t)
+ssh_agent_exec(swrapd_t)
+ssh_exec_keygen(swrapd_t)
+allow swrapd_t { ssh_exec_t ssh_agent_exec_t ssh_keygen_exec_t ifconfig_exec_t }:file map;
+allow swrapd_t { sshd_keygen_exec_t sshd_keygen_unit_file_t sshd_session_exec_t swrap_web_exec_t }:file read_file_perms;
+iptables_run(swrapd_t, system_r)
+sysnet_exec_ifconfig(swrapd_t)
+rpm_exec(swrapd_t)
+rpm_manage_db(swrapd_t)
+rpm_watch_db_dirs(swrapd_t)
+logging_read_audit_log(swrapd_t)
+logging_map_audit_log(swrapd_t)
+logging_read_audit_config(swrapd_t)
+logging_map_audit_config(swrapd_t)
+selinux_read_policy(swrapd_t)
+
+# Network: hosts over ssh, edge, table/HTTP APIs, inference backends (any port), its listeners.
+corenet_tcp_connect_ssh_port(swrapd_t)
+corenet_tcp_connect_http_port(swrapd_t)
+corenet_tcp_connect_all_unreserved_ports(swrapd_t)
+corenet_tcp_bind_generic_node(swrapd_t)
+sysnet_read_config(swrapd_t)
+miscfiles_read_generic_certs(swrapd_t)
+auth_read_passwd_file(swrapd_t)
+nis_use_ypbind_uncond(swrapd_t)
+systemd_userdbd_stream_connect(swrapd_t)
+unconfined_server_stream_connectto(swrapd_t)
+kernel_stream_connect(swrapd_t)
+
+# Session PTYs and the swai sandboxes (bwrap: namespaces, mounts, its tmpfs).
+term_use_ptmx(swrapd_t)
+term_use_generic_ptys(swrapd_t)
+term_mount_pty_fs(swrapd_t)
+kernel_mount_proc(swrapd_t)
+files_mounton_rootfs(swrapd_t)
+allow swrapd_t tmp_t:dir mounton;
+fs_all_mount_fs_perms_tmpfs(swrapd_t)
+fs_all_mount_fs_perms_xattr_fs(swrapd_t)
+fs_manage_tmpfs_dirs(swrapd_t)
+fs_manage_tmpfs_files(swrapd_t)
+fs_manage_tmpfs_symlinks(swrapd_t)
+fs_manage_tmpfs_sockets(swrapd_t)
+allow swrapd_t tmpfs_t:dir { mounton watch };
+allow swrapd_t tmpfs_t:file { mounton watch };
+fs_getattr_nsfs_files(swrapd_t)
+
+# System state for the doctor and core's own inventory (read-only), unit status queries.
+kernel_read_state(swrapd_t)
+kernel_read_system_state(swrapd_t)
+kernel_list_proc(swrapd_t)
+kernel_read_proc_files(swrapd_t)
+kernel_read_sysctl(swrapd_t)
+kernel_read_vm_sysctls(swrapd_t)
+kernel_read_fs_sysctls(swrapd_t)
+kernel_getattr_core_if(swrapd_t)
+dev_read_rand(swrapd_t)
+dev_read_sysfs(swrapd_t)
+dev_list_sysfs(swrapd_t)
+fs_search_cgroup_dirs(swrapd_t)
+allow swrapd_t cgroup_t:file read_file_perms;
+init_read_state(swrapd_t)
+init_telinit(swrapd_t)
+systemd_logind_read_state(swrapd_t)
+systemd_read_generic_unit_lnk_files(swrapd_t)
+systemd_userdbd_runtime_read_symlinks(swrapd_t)
+udev_read_state(swrapd_t)
+cron_read_state_crond(swrapd_t)
+NetworkManager_read_state(swrapd_t)
+
+# Core's own project scan (inventory/table: git work trees under /opt, /srv, /root, /home, …;
+# units that use them): directory listings and unit files only, no reads of other files.
+files_list_non_security(swrapd_t)
+systemd_read_unit_files(swrapd_t)
+require {
+    type admin_home_t;
+}
+allow swrapd_t admin_home_t:file map;
+# Harness versions (VERSION files next to the binaries).
+allow swrapd_t swrap_ai_exec_t:dir list_dir_perms;
+allow swrapd_t swrap_ai_exec_t:file read_file_perms;
+allow swrapd_t swrap_ai_exec_t:lnk_file read_lnk_file_perms;
+
+# Users' homes: ~/swrap-docs links, swai homes created for AAA users, home tools listed.
+files_list_home(swrapd_t)
+userdom_list_user_home_dirs(swrapd_t)
+userdom_manage_user_home_content_dirs(swrapd_t)
+userdom_read_user_home_content_symlinks(swrapd_t)
+userdom_read_admin_home_files(swrapd_t)
+allow swrapd_t home_bin_t:dir list_dir_perms;
+ssh_list_user_home_dir(swrapd_t)
+
+########################################
+# swrap_web_t, drafted the same way: HTTPS on 443, recordings and config (read), swrapd's API.
+
+corenet_tcp_bind_generic_node(swrap_web_t)
+corenet_tcp_bind_http_port(swrap_web_t)
+allow swrap_web_t self:capability net_bind_service;
+allow swrap_web_t self:tcp_socket create_stream_socket_perms;
+allow swrap_web_t self:fifo_file rw_fifo_file_perms;
+allow swrap_web_t self:unix_stream_socket create_stream_socket_perms;
+files_list_var_lib(swrap_web_t)
+files_read_var_lib_files(swrap_web_t)
+allow swrap_web_t var_lib_t:dir list_dir_perms;
+manage_dirs_pattern(swrap_web_t, swrap_var_run_t, swrap_var_run_t)
+manage_sock_files_pattern(swrap_web_t, swrap_var_run_t, swrap_var_run_t)
+allow swrap_web_t swrapd_t:unix_stream_socket connectto;
+kernel_read_system_state(swrap_web_t)
+miscfiles_read_localization(swrap_web_t)
+auth_read_passwd_file(swrap_web_t)
+sysnet_read_config(swrap_web_t)
+dev_read_urand(swrap_web_t)
+

@@ -149,14 +149,34 @@ fn note_fail(s: &AppState, key: &str) {
     e.1 = Instant::now();
 }
 
-fn verify_password(paths: &Paths, user: &str, pw: &str) -> bool {
+/// A hash of a random password, made with the parameters `swpasswd` uses (Argon2id, the vault's
+/// memory capped at 64 MiB, its time cost, one lane): what an attempt for a name without a usable
+/// web password is checked against.
+fn dummy_hash(paths: &Paths) -> &'static str {
+    use argon2::password_hash::{rand_core::OsRng, PasswordHasher, SaltString};
+    static H: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    H.get_or_init(|| {
+        let v = SwrapConfig::load(paths).unwrap_or_default().vault;
+        let params = argon2::Params::new(v.argon2_m_kib.min(65536), v.argon2_t, 1, None).unwrap_or_default();
+        let a = argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
+        let pw = SaltString::generate(&mut OsRng);
+        a.hash_password(pw.as_str().as_bytes(), &SaltString::generate(&mut OsRng)).map(|h| h.to_string()).unwrap_or_default()
+    })
+}
+
+/// Every attempt costs exactly one argon2 verification, whether the name exists, is disabled,
+/// has a web password or not: how long the answer takes says nothing about user names.
+fn verify_login(paths: &Paths, user: &str, pw: &str) -> bool {
     use argon2::password_hash::{PasswordHash, PasswordVerifier};
-    if !swrap_core::paths::safe_component(user) {
-        return false;
-    }
-    let Ok(stored) = std::fs::read_to_string(paths.webpw(user)) else { return false };
-    let Ok(h) = PasswordHash::new(stored.trim()) else { return false };
-    argon2::Argon2::default().verify_password(pw.as_bytes(), &h).is_ok()
+    let real = if swrap_core::paths::safe_component(user) {
+        User::load(paths, user).ok().filter(|u| !u.disabled).and_then(|_| std::fs::read_to_string(paths.webpw(user)).ok())
+    } else {
+        None
+    };
+    let stored = real.as_deref().map(str::trim).filter(|h| PasswordHash::new(h).is_ok());
+    let Ok(h) = PasswordHash::new(stored.unwrap_or_else(|| dummy_hash(paths))) else { return false };
+    let matches = argon2::Argon2::default().verify_password(pw.as_bytes(), &h).is_ok();
+    matches && stored.is_some()
 }
 
 async fn login(State(s): State<St>, Extension(ClientIp(ip)): Extension<ClientIp>, Form(f): Form<LoginForm>) -> Response<Body> {
@@ -170,10 +190,7 @@ async fn login(State(s): State<St>, Extension(ClientIp(ip)): Extension<ClientIp>
     }
     let paths = s.paths.clone();
     let (u, p) = (f.user.clone(), f.password.clone());
-    let ok = tokio::task::spawn_blocking(move || {
-        let acct = User::load(&paths, &u).ok().filter(|x| !x.disabled);
-        acct.is_some() && verify_password(&paths, &u, &p)
-    })
+    let ok = tokio::task::spawn_blocking(move || verify_login(&paths, &u, &p))
     .await
     .unwrap_or(false);
     if !ok {
@@ -240,6 +257,9 @@ async fn asset(UrlPath(name): UrlPath<String>) -> Response<Body> {
         "asciinema-player.css" => ("text/css", include_bytes!("../assets/asciinema-player.css")),
         "app.js" => ("text/javascript", include_bytes!("../assets/app.js")),
         "app.css" => ("text/css", include_bytes!("../assets/app.css")),
+        "x11.css" => ("text/css", include_bytes!("../assets/x11.css")),
+        "x11.js" => ("text/javascript", include_bytes!("../assets/x11.js")),
+        "favicon.svg" => ("image/svg+xml", include_bytes!("../assets/favicon.svg")),
         "LICENSE-asciinema-player.txt" => ("text/plain", include_bytes!("../assets/asciinema-player.LICENSE")),
         _ => return StatusCode::NOT_FOUND.into_response(),
     };
@@ -343,6 +363,8 @@ async fn rec_meta(State(s): State<St>, h: HeaderMap, UrlPath(id): UrlPath<String
 #[derive(Deserialize)]
 struct CastQ {
     keys: Option<String>,
+    /// Transcript times: UTC (Z) unless `local=1` (the page's "local time" box).
+    local: Option<String>,
 }
 
 async fn rec_cast(State(s): State<St>, h: HeaderMap, UrlPath(id): UrlPath<String>, Query(q): Query<CastQ>) -> Response<Body> {
@@ -370,17 +392,57 @@ async fn rec_text(State(s): State<St>, h: HeaderMap, UrlPath(id): UrlPath<String
         Err(c) => return c.into_response(),
     };
     let keys = q.keys.as_deref() == Some("1");
+    let local = q.local.as_deref() == Some("1");
     let tz = cfg(&s).general.display_timezone;
     let r = tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
         let scan = swrec::scan(&path, swrec::ScanOpts { verifier: None, keep_records: true, live: false })?;
         let mut out = vec![];
-        let o = swrec::text::CatOpts { tz: &tz, utc: false, keys, cmds: true, raw: false };
+        let o = swrec::text::CatOpts { tz: &tz, utc: !local, keys, cmds: true, raw: false };
         swrec::text::cat(None, &scan.records, &o, &mut out)?;
         Ok(out)
     })
     .await;
     match r {
         Ok(Ok(t)) => ([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], t).into_response(),
+        _ => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+/// swai chat (spec 24.9): `swrec::ai::chat` with each time also as a display pair.
+async fn rec_chat(State(s): State<St>, h: HeaderMap, UrlPath(id): UrlPath<String>) -> Response<Body> {
+    let (path, _, _) = match resolve(&s, &h, &id) {
+        Ok(x) => x,
+        Err(c) => return c.into_response(),
+    };
+    let live = is_live(&s, &id);
+    let tz = cfg(&s).general.display_timezone;
+    let r = tokio::task::spawn_blocking(move || -> Result<Value> {
+        let scan = swrec::scan(&path, swrec::ScanOpts { verifier: None, keep_records: true, live })?;
+        let mut c = swrec::ai::chat(&scan.records);
+        let pair = |v: &mut Value, k: &str, d: &str| {
+            if let Some(ts) = v.get(k).and_then(Value::as_str).map(String::from) {
+                v[d] = disp(&ts, &tz);
+            }
+        };
+        pair(&mut c, "start", "start_disp");
+        pair(&mut c["end"], "ts", "ts_disp");
+        for it in c["items"].as_array_mut().into_iter().flatten() {
+            pair(it, "ts", "ts_disp");
+            if let Some(e) = it.get_mut("exec") {
+                pair(e, "started", "started_disp");
+            }
+            for t in it.get_mut("tools").and_then(Value::as_array_mut).into_iter().flatten() {
+                if let Some(e) = t.get_mut("exec") {
+                    pair(e, "started", "started_disp");
+                }
+            }
+        }
+        c["live"] = json!(live);
+        Ok(c)
+    })
+    .await;
+    match r {
+        Ok(Ok(v)) => ([(header::CONTENT_TYPE, "application/json")], v.to_string()).into_response(),
         _ => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
@@ -569,6 +631,7 @@ fn app(state: St) -> Router<()> {
         .route("/api/rec/{id}/meta", get(rec_meta))
         .route("/api/rec/{id}/cast", get(rec_cast))
         .route("/api/rec/{id}/text", get(rec_text))
+        .route("/api/rec/{id}/chat", get(rec_chat))
         .route("/api/rec/{id}/live", get(rec_live))
         .route("/assets/{name}", get(asset))
         .layer(axum::middleware::from_fn_with_state(state.clone(), allowlist))
@@ -658,6 +721,8 @@ fn main() -> Result<()> {
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().worker_threads(2).build()?;
     rt.block_on(async move {
         let state = Arc::new(AppState { paths, sessions: Mutex::new(HashMap::new()), fails: Mutex::new(HashMap::new()) });
+        // Made now, so the first attempt for an unknown name is not the one slower answer.
+        let _ = dummy_hash(&state.paths);
         let c = cfg(&state);
         let mut tasks = vec![];
         for b in &c.web.bind {
@@ -682,4 +747,47 @@ fn main() -> Result<()> {
         r??;
         Ok(())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Unknown, invalid, disabled and password-less names take as long as a real user with a
+    /// wrong password: one argon2 verification each.
+    #[test]
+    fn login_time_does_not_tell_names_apart() {
+        use argon2::password_hash::{rand_core::OsRng, PasswordHasher, SaltString};
+        let root = std::env::temp_dir().join(format!("swrap-web-enum-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let paths = Paths::at(&root, root.join("run"));
+        std::fs::create_dir_all(paths.users()).unwrap();
+        std::fs::create_dir_all(paths.webpw("x").parent().unwrap()).unwrap();
+        for (name, disabled) in [("alice", false), ("bob", true), ("carol", false)] {
+            std::fs::write(paths.users().join(format!("{name}.toml")), format!("name = \"{name}\"\nrole = \"user\"\ndisabled = {disabled}\n")).unwrap();
+        }
+        let v = SwrapConfig::default().vault;
+        let params = argon2::Params::new(v.argon2_m_kib.min(65536), v.argon2_t, 1, None).unwrap();
+        let a = argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
+        let h = a.hash_password(b"correct horse battery", &SaltString::generate(&mut OsRng)).unwrap().to_string();
+        for n in ["alice", "bob"] {
+            std::fs::write(paths.webpw(n), format!("{h}\n")).unwrap();
+        }
+        assert!(verify_login(&paths, "alice", "correct horse battery"));
+        assert!(!verify_login(&paths, "bob", "correct horse battery"), "disabled");
+        let _ = dummy_hash(&paths);
+        let time = |u: &str| {
+            let t0 = Instant::now();
+            for _ in 0..3 {
+                assert!(!verify_login(&paths, u, "wrong password"));
+            }
+            t0.elapsed().as_secs_f64() / 3.0
+        };
+        let real = time("alice");
+        for u in ["nobody", "../etc", "bob", "carol"] {
+            let t = time(u);
+            assert!(t > real * 0.6 && t < real * 1.6, "{u}: {t:.3}s vs a real user's {real:.3}s");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

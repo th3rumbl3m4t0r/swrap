@@ -258,11 +258,14 @@ mod tests {
                     sudo: sudo.to_string(),
                     managed_by_swrap: *m,
                     integration: true,
+                    locked: false,
                 })
                 .collect(),
             enroll_progress: vec![],
             network: Route::Core,
             ai_allowed: false,
+            ai_reset: false,
+            proxmox: None,
         }
     }
 
