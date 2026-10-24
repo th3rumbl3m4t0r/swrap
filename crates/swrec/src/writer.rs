@@ -294,6 +294,10 @@ impl Writer {
     }
 
     fn write_line(&mut self, v: &Value) -> Result<()> {
+        // Nothing follows the end record: the file is complete (doctor would call it tampered).
+        if self.ended {
+            anyhow::bail!("the recording has ended");
+        }
         let line = encode_line(&serde_json::to_vec(v)?);
         if let Some(bg) = &self.bg {
             if bg.failed.load(std::sync::atomic::Ordering::SeqCst) {
@@ -670,6 +674,23 @@ mod tests {
         assert_eq!(r.report.damaged.len(), 1);
         assert_eq!(r.report.signature, Some(true));
         assert!(Writer::resume(&p, WriterOpts::default()).unwrap().is_none());
+    }
+
+    #[test]
+    fn nothing_after_the_end_record() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("e.swrec");
+        let s = RecSigner::generate("core");
+        let mut v = RecVerifier::new();
+        v.add_pub_text("core", &s.public_text()).unwrap();
+        let mut w = Writer::create(&p, "ID3", json!({"kind":"ai"}).as_object().unwrap().clone(), WriterOpts::default()).unwrap();
+        w.note("before").unwrap();
+        w.end("ticket done", Some(0), Some(&s)).unwrap();
+        assert!(w.note("inference proxy: Broken pipe (os error 32)").is_err());
+        drop(w);
+        let r = scan(&p, ScanOpts { verifier: Some(&v), keep_records: false, live: false }).unwrap();
+        assert_eq!(r.report.status, Status::Ok, "{:?}", r.report);
+        assert_eq!(r.report.signature, Some(true));
     }
 
     #[test]

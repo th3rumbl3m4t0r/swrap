@@ -126,6 +126,50 @@ fn recent_models(d: &Daemon, backend: &str) -> Vec<Value> {
 
 // ---------------------------------------------------------------- wizard data
 
+/// The server's own state from its status URL, in one line: paused on UPS battery, thermal
+/// throttling, queue, model. None without a status URL.
+pub fn backend_live(b: &AiBackend) -> Option<String> {
+    if b.status_url.is_empty() {
+        return None;
+    }
+    let agent = http(Duration::from_secs(3));
+    let v: Value = match agent.get(&b.status_url).call() {
+        Ok(mut r) if r.status() == 200 => r.body_mut().read_to_string().ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or(Value::Null),
+        Ok(r) => return Some(format!("status HTTP {}", r.status())),
+        Err(_) => return Some("status unreachable (server down?)".into()),
+    };
+    Some(live_summary(&v))
+}
+
+/// A server status says it is paused (UPS on battery).
+pub fn status_paused(v: &Value) -> bool {
+    v["state"] == "on_battery" || v["ups"]["on_battery"] == true
+}
+
+/// One line from a server status: paused on UPS battery, or state, model, queue, GPU, throttling.
+fn live_summary(v: &Value) -> String {
+    if status_paused(v) {
+        let back = v["ups"]["mains_back_since_s"].as_u64().map(|s| format!("; mains back for PT{s}S")).unwrap_or_default();
+        return format!("ON UPS BATTERY: inference paused{back} (sessions wait for mains)");
+    }
+    let mut parts = vec![];
+    if let Some(m) = v["model"].as_str() {
+        parts.push(format!("model {m}"));
+    }
+    if let (Some(r), Some(q)) = (v["running"].as_u64(), v["queued"].as_u64()) {
+        parts.push(format!("{r} running, {q} queued"));
+    }
+    if let Some(t) = v["gpu"]["temp_c"].as_u64() {
+        let hbm = v["gpu"]["mem_temp_c"].as_u64().map(|m| format!(" (HBM {m} °C)")).unwrap_or_default();
+        parts.push(format!("GPU {t} °C{hbm}"));
+    }
+    if v["gpu"]["thermal_throttle"] == true {
+        parts.push("THERMAL THROTTLING (slow)".into());
+    }
+    let state = v["state"].as_str().unwrap_or("?");
+    if parts.is_empty() { state.to_string() } else { format!("{state} · {}", parts.join(" · ")) }
+}
+
 fn backend_state(d: &Daemon, b: &AiBackend) -> (bool, String) {
     if b.api == AiApi::ClaudeCode && !Path::new(CLAUDE_DIR).join("claude").exists() {
         return (false, "Claude Code is not installed (run swrap install)".into());
@@ -162,7 +206,7 @@ pub fn options(d: &Arc<Daemon>, c: &Caller) -> Result<Resp> {
         .iter()
         .map(|b| {
             let (ready, why) = backend_state(d, b);
-            json!({"name": b.name, "api": b.api.as_str(), "base_url": b.base_url, "ready": ready, "why": why, "recent": recent_models(d, &b.name), "models": b.models, "harness": if b.api == AiApi::ClaudeCode { format!("Claude Code {}", claude_version()) } else { format!("opencode {}", opencode_version()) }})
+            json!({"name": b.name, "api": b.api.as_str(), "base_url": b.base_url, "ready": ready, "why": why, "status": backend_live(b), "recent": recent_models(d, &b.name), "models": b.models, "harness": if b.api == AiApi::ClaudeCode { format!("Claude Code {}", claude_version()) } else { format!("opencode {}", opencode_version()) }})
         })
         .collect();
     Ok(Resp::ok(json!({
@@ -314,6 +358,10 @@ fn model_info(b: &AiBackend, key: Option<&str>, model: &str) -> ModelInfo {
                 ModelInfo { context: 1_000_000, max_output: 128_000, efforts: EFFORTS.iter().map(|e| e.to_string()).collect(), adaptive: true }
             }
         }
+        _ if b.context > 0 => {
+            let max_output = if b.max_output > 0 { b.max_output } else { (b.context / 4).clamp(1024, 32_768) };
+            ModelInfo { context: b.context, max_output, efforts: vec![], adaptive: false }
+        }
         AiApi::Openai => {
             let mut ctx = None;
             if let Ok((200, v)) = get_json(&agent, &format!("{base}/v1/models"), b, key) {
@@ -398,7 +446,7 @@ pub fn add_backend(d: &Arc<Daemon>, c: &Caller, addr: &str, con: &Console) -> Re
     for p in &ports {
         let base = format!("http://{host}:{p}");
         con.out(format!("probing {base}/v1/models …"));
-        let probe = AiBackend { name: String::new(), api: AiApi::Openai, base_url: base.clone(), models: vec![], needs_key: false, timeout: "PT1H".into(), max_concurrent: 0, added_by: String::new(), created: String::new() };
+        let probe = AiBackend { name: String::new(), api: AiApi::Openai, base_url: base.clone(), models: vec![], needs_key: false, timeout: "PT1H".into(), max_concurrent: 0, context: 0, max_output: 0, status_url: String::new(), wait_unavailable: false, raw_tools: false, added_by: String::new(), created: String::new() };
         if let Ok((200, v)) = get_json(&agent, &format!("{base}/v1/models"), &probe, None) {
             if let Some(a) = v["data"].as_array() {
                 let names: Vec<String> = a.iter().filter_map(|m| m["id"].as_str().map(String::from)).collect();
@@ -415,7 +463,7 @@ pub fn add_backend(d: &Arc<Daemon>, c: &Caller, addr: &str, con: &Console) -> Re
         let _g = d.config_lock.lock().unwrap();
         let mut ai = AiConfig::load(&d.paths)?;
         if ai.backend(&name).is_none() && !ai.backends.iter().any(|b| b.base_url == base) {
-            ai.backends.push(AiBackend { name: name.clone(), api: AiApi::Openai, base_url: base.clone(), models: vec![], needs_key: false, timeout: "PT1H".into(), max_concurrent: 0, added_by: c.name.clone(), created: fmt_utc_secs(now()) });
+            ai.backends.push(AiBackend { name: name.clone(), api: AiApi::Openai, base_url: base.clone(), models: vec![], needs_key: false, timeout: "PT1H".into(), max_concurrent: 0, context: 0, max_output: 0, status_url: String::new(), wait_unavailable: false, raw_tools: false, added_by: c.name.clone(), created: fmt_utc_secs(now()) });
             d.write_config("ai.toml", &ai.to_toml())?;
             d.commit(&format!("swai backend {name} added by {}", c.name))?;
         }
@@ -442,13 +490,20 @@ struct Session {
     loose: bool,
     /// Place in a handoff chain (0 = started by the user).
     chain: usize,
+    /// A nightly ticket session: the table entry (0 = none) and its number.
+    ticket: i64,
+    ticket_no: String,
 }
 
-/// A successor started by `handoff`: its first prompt, its predecessor, its place in the chain.
-struct Handoff {
+/// A session swrap starts by itself, without a client: a `handoff` successor (its predecessor
+/// and place in the chain) or a nightly ticket session; both begin with `prompt`.
+struct Launch {
     prompt: String,
+    /// The predecessor ("" = not a successor).
     continues: String,
     chain: usize,
+    ticket: i64,
+    ticket_no: String,
 }
 
 fn sessions() -> &'static Mutex<HashMap<String, Arc<Session>>> {
@@ -483,6 +538,8 @@ fn lookup(d: &Daemon, id: &str) -> Option<Arc<Session>> {
         effort: v["effort"].as_str().unwrap_or("").to_string(),
         loose: v["loose"].as_bool().unwrap_or(false),
         chain: v["chain"].as_u64().unwrap_or(0) as usize,
+        ticket: v["ticket"].as_i64().unwrap_or(0),
+        ticket_no: v["ticket_no"].as_str().unwrap_or("").to_string(),
     });
     sessions().lock().unwrap().insert(id.to_string(), s.clone());
     Some(s)
@@ -636,6 +693,54 @@ fn kill(d: &Daemon, c: &Caller, id: &str) -> Result<Resp> {
     Ok(Resp::text(format!("swai session {} ended\n", j["id"].as_str().unwrap_or(""))))
 }
 
+/// The live marker of a running session (`None` once it ended).
+pub fn live_info(d: &Daemon, id: &str) -> Option<Value> {
+    crate::session::live_sessions(d).into_iter().find(|j| j["kind"] == "ai" && j["id"] == id)
+}
+
+/// End a session for swrap itself (the ticket worker's limits); `false` if it is not running.
+pub fn end_session(d: &Daemon, id: &str, why: &str) -> bool {
+    let Some(j) = live_info(d, id) else { return false };
+    let pid = j["pid"].as_i64().unwrap_or(0) as i32;
+    if pid <= 1 {
+        return false;
+    }
+    unsafe { libc::kill(pid, libc::SIGTERM) };
+    d.audit_event("swrap", "ai.kill", j["target"].as_str().unwrap_or(""), "", "ok", json!({"owner": j["user"], "why": why}), id);
+    true
+}
+
+/// A ticket session for `user` on `target` (a host label, or aaa; tools without prompts; it
+/// starts detached, like a handoff successor, and `user` may attach to watch). Returns its id.
+#[allow(clippy::too_many_arguments)]
+pub fn start_unattended(d: &Arc<Daemon>, user: &str, target: &str, backend: &str, model: &str, effort: &str, prompt: &str, ticket: i64, ticket_no: &str) -> Result<String> {
+    let u = User::load(&d.paths, user)?;
+    if u.disabled || u.is_admin() {
+        bail!("{user} cannot use swai (disabled or an admin)");
+    }
+    let req = Req::AiStart {
+        target: target.into(),
+        backend: backend.into(),
+        model: model.into(),
+        effort: effort.into(),
+        cols: 160,
+        rows: 48,
+        term: "xterm-256color".into(),
+        client_addr: "tickets".into(),
+        conn: String::new(),
+        resume: String::new(),
+        loose: false,
+    };
+    let uid = nix::unistd::User::from_name(user).ok().flatten().map(|x| x.uid.as_raw()).unwrap_or(0);
+    let caller = Caller { uid, pid: 0, name: user.to_string(), user: Some(u), admin: false, origin: Node::Core };
+    let (ours, theirs) = UnixStream::pair()?;
+    drop(theirs);
+    let launch = Launch { prompt: prompt.to_string(), continues: String::new(), chain: 0, ticket, ticket_no: ticket_no.to_string() };
+    let id = start_inner(d, &caller, &req, &ours, Node::Core, false, Some(&launch))?;
+    drop(ours);
+    Ok(id)
+}
+
 fn valid_model(m: &str) -> bool {
     !m.is_empty() && m.len() <= 200 && m.bytes().all(|b| b.is_ascii_alphanumeric() || b"._:/@+-".contains(&b))
 }
@@ -649,7 +754,7 @@ fn mem_available_mb() -> Option<u64> {
 
 /// Starts a session for `c` (`s`: the client's connection). A handoff successor has no client
 /// yet (it runs detached until one attaches) and starts from its predecessor's briefing.
-fn start_inner(d: &Arc<Daemon>, c: &Caller, req: &Req, s: &UnixStream, origin: Node, delegated: bool, handoff: Option<&Handoff>) -> Result<String> {
+fn start_inner(d: &Arc<Daemon>, c: &Caller, req: &Req, s: &UnixStream, origin: Node, delegated: bool, launch: Option<&Launch>) -> Result<String> {
     let Req::AiStart { target, backend, model, effort, cols, rows, term, client_addr, conn, resume, loose } = req else { bail!("not an AI session request") };
     let loose = *loose;
     let resume_ok = resume.is_empty()
@@ -708,7 +813,11 @@ fn start_inner(d: &Arc<Daemon>, c: &Caller, req: &Req, s: &UnixStream, origin: N
         bail!("letting the AI loose (no permission prompts) is for one host, not the whole AAA");
     }
     sweep(d);
-    // A successor replaces its predecessor, which ends seconds later: no limit checks.
+    // A successor replaces its predecessor, which ends seconds later: no limit checks. A ticket
+    // session needs the memory, but is not one of the user's own sessions.
+    let handoff = launch.filter(|l| !l.continues.is_empty());
+    let ticket = launch.map(|l| l.ticket).unwrap_or(0);
+    let ticket_no = launch.map(|l| l.ticket_no.clone()).unwrap_or_default();
     if handoff.is_none() {
         if let Some(avail) = mem_available_mb() {
             if avail < ai.limits.min_available_mb {
@@ -716,7 +825,7 @@ fn start_inner(d: &Arc<Daemon>, c: &Caller, req: &Req, s: &UnixStream, origin: N
             }
         }
     }
-    if handoff.is_none() && live_ai(d, &c.name) >= ai.limits.sessions_per_user {
+    if launch.is_none() && live_ai(d, &c.name) >= ai.limits.sessions_per_user {
         bail!("you already run {} swai sessions (the limit); see them with swai ls, reattach with swai attach, end one with swai kill <id>", ai.limits.sessions_per_user);
     }
     let key = backend_key(d, &b)?;
@@ -738,11 +847,12 @@ fn start_inner(d: &Arc<Daemon>, c: &Caller, req: &Req, s: &UnixStream, origin: N
     std::os::unix::fs::chown(&sock_dir, Some(d.swrap_uid), Some(swai_gid))?;
     let chain = handoff.map(|h| h.chain).unwrap_or(0);
     let reg = json!({"user": c.name, "token_b3": blake3::hash(token.as_bytes()).to_hex().to_string(), "mode": mode, "label": label, "ruser": ruser, "backend": b.name, "max_calls": ai.limits.max_tool_calls, "started": fmt_utc(t),
-                     "model": model, "effort": effort, "loose": loose, "chain": chain});
+                     "model": model, "effort": effort, "loose": loose, "chain": chain, "ticket": ticket, "ticket_no": &ticket_no});
     swrap_core::atomic::write(&session_file(d, &id), reg.to_string().as_bytes(), 0o600, swrap_core::atomic::Owner::new(0, 0))?;
     // Persistent homes: opencode per (user, target); Claude Code one per user (it holds the
     // Claude login) with a working directory per target, which keys its conversation history.
-    let tgt_dir = if mode == "aaa" { "aaa".to_string() } else { label.clone() };
+    // Ticket sessions keep theirs apart from the user's own aaa conversations.
+    let tgt_dir = if ticket != 0 { "tickets".to_string() } else if mode == "aaa" { "aaa".to_string() } else { label.clone() };
     let home = if claude { d.paths.ai_homes().join(&c.name).join("claude") } else { d.paths.ai_homes().join(&c.name).join(&tgt_dir) };
     for (p, mode_bits, own) in [
         (d.paths.root.join("ai"), 0o711, (0, 0)),
@@ -796,6 +906,9 @@ fn start_inner(d: &Arc<Daemon>, c: &Caller, req: &Req, s: &UnixStream, origin: N
         header.insert("continues".into(), json!(h.continues));
         header.insert("chain".into(), json!(h.chain));
     }
+    if ticket != 0 {
+        header.insert("ticket".into(), json!({"id": ticket, "number": &ticket_no}));
+    }
     let cfg = d.cfg();
     let what = if mode == "aaa" { "aaa".to_string() } else { format!("{ruser}@{label}") };
     let mut banner = format!(
@@ -810,10 +923,13 @@ fn start_inner(d: &Arc<Daemon>, c: &Caller, req: &Req, s: &UnixStream, origin: N
     if loose {
         banner.push_str(&format!("\r\nswai: LOOSE: no permission prompts{} on {what}; every action is still recorded", if claude { " (--dangerously-skip-permissions)" } else { "" }));
     }
+    if ticket != 0 {
+        banner.push_str(&format!("\r\nswai: ticket worker on {ticket_no} (unattended: tools run without asking; it ends after ticket_result)"));
+    }
     if let Some(u) = crate::session::view_url(d, origin, &id) {
         banner.push_str(&format!("\r\nswrap: view {u}"));
     }
-    let hosts_list = if mode == "aaa" { ai_hosts_text(d, &user) } else { String::new() };
+    let hosts_list = if mode == "aaa" { ai_hosts_text(d, &user, None) } else if ticket != 0 { ai_hosts_text(d, &user, Some(&label)) } else { String::new() };
     let spec = WorkerSpec {
         mode: "ai".into(),
         id: id.clone(),
@@ -850,6 +966,9 @@ fn start_inner(d: &Arc<Daemon>, c: &Caller, req: &Req, s: &UnixStream, origin: N
             context,
             max_output: info.max_output,
             timeout_secs: IsoDuration::parse(&b.timeout).ok().and_then(|x| x.exact()).map(|x| x.as_secs()).unwrap_or(600),
+            status_url: b.status_url.clone(),
+            wait_unavailable: b.wait_unavailable,
+            raw_tools: b.raw_tools && b.api == AiApi::Openai,
             run_dir: run_dir.to_string_lossy().into(),
             home: home.to_string_lossy().into(),
             swai_uid,
@@ -860,13 +979,13 @@ fn start_inner(d: &Arc<Daemon>, c: &Caller, req: &Req, s: &UnixStream, origin: N
             opencode: oc.to_string_lossy().into(),
             opencode_version: ocv,
             helper: swrap_core::paths::libexec("swrap").to_string_lossy().into(),
-            system_prompt: system_prompt(&mode, &user.name, host.as_ref(), &ruser, &hosts_list, cfg.tz()),
-            tools: tool_defs(&mode),
+            system_prompt: if ticket != 0 { crate::tickets::system_prompt(d, &user.name, (mode == "host").then_some(label.as_str()), &hosts_list, cfg.tz()) } else { system_prompt(&mode, &user.name, host.as_ref(), &ruser, &hosts_list, cfg.tz()) },
+            tools: tool_defs(&mode, ticket != 0),
             max_tool_calls: ai.limits.max_tool_calls,
             tz: cfg.tz().to_string(),
-            approval: if loose || ai.limits.approval == "allow" { "allow".into() } else { "ask".into() },
+            approval: if loose || ticket != 0 || ai.limits.approval == "allow" { "allow".into() } else { "ask".into() },
             loose,
-            first_prompt: handoff.map(|h| h.prompt.clone()).unwrap_or_default(),
+            first_prompt: launch.map(|h| h.prompt.clone()).unwrap_or_default(),
             handoff_warn: ai.limits.handoff_warn,
             chain,
             max_handoffs: ai.limits.max_handoffs,
@@ -877,12 +996,13 @@ fn start_inner(d: &Arc<Daemon>, c: &Caller, req: &Req, s: &UnixStream, origin: N
             // that version's directory, so a nightly update never changes it under the session.
             claude: std::fs::canonicalize(&cc).unwrap_or(cc.clone()).to_string_lossy().into(),
             workdir: workdir.clone(),
+            ticket,
         }),
         sftp: None,
     };
     let pid = crate::session::spawn_worker_ex(d, &spec, s, true)?;
     note_usage(d, &b.name, model);
-    d.audit_event(&c.name, "ai.start", if mode == "aaa" { "aaa" } else { &label }, &ruser, "ok", json!({"backend": b.name, "model": model, "effort": effort, "loose": loose, "continues": handoff.map(|h| h.continues.as_str()), "chain": chain, "origin": origin.as_str(), "delegated": delegated, "client_addr": client_addr, "worker_pid": pid}), &id);
+    d.audit_event(&c.name, "ai.start", if mode == "aaa" { "aaa" } else { &label }, &ruser, "ok", json!({"backend": b.name, "model": model, "effort": effort, "loose": loose, "continues": handoff.map(|h| h.continues.as_str()), "chain": chain, "ticket": (ticket != 0).then_some(&ticket_no), "origin": origin.as_str(), "delegated": delegated, "client_addr": client_addr, "worker_pid": pid}), &id);
     Ok(id)
 }
 
@@ -904,10 +1024,14 @@ fn trust_workdir(home: &Path, workdir: &str, uid: u32, gid: u32) {
     let _ = swrap_core::atomic::write(&p, serde_json::to_string_pretty(&v).unwrap_or_default().as_bytes(), 0o600, swrap_core::atomic::Owner::new(uid, gid));
 }
 
-fn ai_hosts_text(d: &Daemon, user: &User) -> String {
+/// The hosts `user` may act on with AI (`only`: just that one), one per line.
+pub fn ai_hosts_text(d: &Daemon, user: &User, only: Option<&str>) -> String {
     let t = now();
     let mut s = String::new();
     for h in Host::all(&d.paths).unwrap_or_default() {
+        if only.is_some_and(|l| l != h.label) {
+            continue;
+        }
         let accts = rbac::ai_accounts(user, &h, t);
         if accts.is_empty() {
             continue;
@@ -951,7 +1075,8 @@ fn system_prompt(mode: &str, user: &str, host: Option<&Host>, ruser: &str, hosts
     }
 }
 
-fn tool_defs(mode: &str) -> Value {
+/// The MCP tools of a session; `ticket`: a nightly ticket session (reboot and the ticket tools).
+fn tool_defs(mode: &str, ticket: bool) -> Value {
     let aaa = mode == "aaa";
     let with_target = |mut props: Value, required: &[&str]| -> Value {
         let mut req: Vec<Value> = required.iter().map(|r| json!(r)).collect();
@@ -989,10 +1114,32 @@ fn tool_defs(mode: &str) -> Value {
                 "replace_all": {"type": "boolean"}
             }), &["path", "old_string", "new_string"])}),
     ];
+    // The nightly ticket worker's own tools: fleet operations it runs without anyone approving
+    // them, and its ticket. Interactive sessions do not have them (exec asks there).
+    if ticket {
+        tools.push(json!({"name": "update", "description": "Install package updates on the host, like swupdate: dnf upgrade --refresh of all packages, or of one. Needs root there (or swrap-managed sudo). Recorded as a swupdate run; the host is inventoried again afterwards. Returns the result, packages changed and whether a reboot is needed.",
+            "inputSchema": with_target(json!({
+                "package": {"type": "string", "description": "One package name (default: all packages)."}
+            }), &[])}));
+        tools.push(json!({"name": "inventory", "description": "Refresh swrap's inventory of the host (OS, kernel, pending and security updates, reboot needed, reachability) and list the conditions swrap raises tickets for.",
+            "inputSchema": with_target(json!({}), &[])}));
+        tools.push(json!({"name": "reboot", "description": "Reboot the host, wait until it is back (up to PT15M), then refresh its inventory. Only hosts on the nightly worker's reboot list.",
+            "inputSchema": with_target(json!({"reason": {"type": "string", "description": "Why, for the record."}}), &["reason"])}));
+        tools.push(json!({"name": "ticket", "description": "The ticket this session works on, as it is in table now: status, description, worknotes, solution.", "inputSchema": {"type": "object", "properties": {}}}));
+        tools.push(json!({"name": "ticket_result", "description": "How the ticket ends: resolved (fixed and verified, with a solution), report (an investigation is done: the findings go back to the person), assign (to the person: it needs access, a decision, or anything that is not yours), or retry (another night should work without anyone doing anything). worknotes are appended to the ticket. Call it once; the session ends right after.",
+            "inputSchema": {"type": "object", "properties": {
+                "outcome": {"type": "string", "enum": ["resolved", "report", "assign", "retry"]},
+                "worknotes": {"type": "string", "description": "Findings (for report: what you checked, the likely cause with its evidence, what you recommend), what you did (with swrap run ids), what is left."},
+                "solution": {"type": "string", "description": "For resolved: what was done and how it was verified."},
+                "duplicates": {"type": "array", "items": {"type": "string"}, "description": "Ticket numbers from your first prompt's list of other tickets on the same asset that this result settles too (the same condition raised again). They get the same outcome and worknotes."}
+            }, "required": ["outcome", "worknotes"]}}));
+    }
     tools.push(json!({"name": "handoff", "description": "Continue in a new swai session with a fresh tool budget, from a briefing you write. Call it when a tool result says the budget is running out or exhausted (it costs no budget). The new session starts with only this briefing and a list of your last tool calls, not this conversation: include the goal, what is done and verified, the current state, what is left, the exact next step, and every path, command, finding and decision it needs. This session ends right after.",
         "inputSchema": {"type": "object", "properties": {"briefing": {"type": "string", "description": "Everything the next session needs to carry on (plain text or Markdown)."}}, "required": ["briefing"]}}));
     if aaa {
         tools.push(json!({"name": "hosts", "description": "List the hosts and accounts you may act on.", "inputSchema": {"type": "object", "properties": {}}}));
+    }
+    if aaa || ticket {
         tools.push(json!({"name": "sessions", "description": "List the user's recordings (kinds sw, shell, ai, sftp) that overlap a time window: start, id, kind, target, status.",
             "inputSchema": {"type": "object", "properties": {"window": {"type": "string", "description": "ISO 8601 interval, default P7D/now (e.g. 2026-09-01/P2D)."}}}}));
         tools.push(json!({"name": "search", "description": "Search the user's recordings. Terms: host:, ruser:, kind:, node:, cmd:, out:, keys:, file:, free text; \"quoted phrase\", /regex/, -term excludes; window:P7D/now (default P7D/now).",
@@ -1067,7 +1214,8 @@ fn tool_call(d: &Arc<Daemon>, s: &Session, user: &User, args: &Value, con: &Cons
     let limits = AiConfig::load(&d.paths).map(|c| c.limits).unwrap_or_default();
     // Limits (spec 24.7): per session, per user per hour, per user in flight.
     let n = s.calls.fetch_add(1, Ordering::SeqCst) + 1;
-    if n > s.max_calls {
+    // A ticket session can always end its ticket.
+    if n > s.max_calls && name != "ticket_result" {
         return Ok(tool_err(format!("tool budget of this swai session is exhausted ({} calls): call handoff with a complete briefing; a new session continues with a fresh budget", s.max_calls)));
     }
     let _guard = {
@@ -1086,11 +1234,15 @@ fn tool_call(d: &Arc<Daemon>, s: &Session, user: &User, args: &Value, con: &Cons
         u.in_flight += 1;
         InFlight(s.user.clone())
     };
+    let _busy = (s.ticket != 0).then(|| crate::tickets::ToolGuard::new(&s.id));
     let t0 = Instant::now();
     let r = match name {
         "exec" | "read_file" | "write_file" | "edit_file" => host_tool(d, s, user, name, a),
-        "hosts" if s.mode == "aaa" => Ok(ToolOut::text(ai_hosts_text(d, user))),
-        "sessions" | "search" | "transcript" if s.mode == "aaa" => records_tool(d, user, name, a),
+        "update" | "inventory" | "reboot" if s.ticket != 0 => ops_tool(d, s, user, name, a),
+        "ticket" | "ticket_result" if s.ticket != 0 => crate::tickets::tool(d, s.ticket, &s.id, name, a).map(ToolOut::text),
+        "hosts" if s.mode == "aaa" => Ok(ToolOut::text(ai_hosts_text(d, user, None))),
+        // A ticket session on one host reads the user's recordings too (what was done before).
+        "sessions" | "search" | "transcript" if s.mode == "aaa" || s.ticket != 0 => records_tool(d, user, name, a),
         _ => Err(anyhow!("unknown tool {name}")),
     };
     let dur = t0.elapsed();
@@ -1150,9 +1302,12 @@ fn handoff(d: &Arc<Daemon>, s: &Session, user: &User, args: &Value) -> Result<Re
     // detached (as after ctrl-\) until someone attaches.
     let (ours, theirs) = UnixStream::pair()?;
     drop(theirs);
-    let ho = Handoff { prompt, continues: s.id.clone(), chain };
+    let ho = Launch { prompt, continues: s.id.clone(), chain, ticket: s.ticket, ticket_no: s.ticket_no.clone() };
     let id = start_inner(d, &caller, &req, &ours, Node::Core, false, Some(&ho))?;
     drop(ours);
+    if s.ticket != 0 {
+        crate::tickets::moved(d, s.ticket, &s.id, &id);
+    }
     d.audit_event(&s.user, "ai.handoff", if s.mode == "aaa" { "aaa" } else { &s.label }, &s.ruser, "ok", json!({"from": s.id, "to": id, "chain": chain, "briefing_bytes": briefing.len()}), &s.id);
     Ok(Resp::ok(json!({"id": id, "chain": chain, "max_handoffs": ai.limits.max_handoffs, "max_calls": ai.limits.max_tool_calls})))
 }
@@ -1164,6 +1319,9 @@ fn summarize(name: &str, a: &Value) -> String {
         "search" => a["query"].as_str().unwrap_or("").to_string(),
         "transcript" => a["id"].as_str().unwrap_or("").to_string(),
         "sessions" => a["window"].as_str().unwrap_or("").to_string(),
+        "update" => a["package"].as_str().filter(|p| !p.is_empty()).unwrap_or("all packages").to_string(),
+        "reboot" => a["reason"].as_str().unwrap_or("").to_string(),
+        "ticket_result" => a["outcome"].as_str().unwrap_or("").to_string(),
         _ => String::new(),
     };
     s.chars().take(300).collect()
@@ -1463,6 +1621,115 @@ fn host_tool(d: &Arc<Daemon>, s: &Session, user: &User, name: &str, a: &Value) -
     Ok(out)
 }
 
+/// The account to act as root with on `t`'s host under the AI grant: root, else an account with
+/// swrap-managed NOPASSWD sudo (then `true`).
+fn root_capable(d: &Daemon, user: &User, t: &Target) -> Result<(String, bool)> {
+    let accts = rbac::ai_accounts(user, &t.host, now());
+    let has = |a: &str| crate::session::credential(d, &t.host.label, a).is_some();
+    if (t.ruser == "root" || accts.iter().any(|a| a == "root")) && has("root") {
+        return Ok(("root".into(), false));
+    }
+    let sudo = |a: &str| t.host.accounts.iter().any(|x| x.name == a && x.sudo == "nopasswd" && x.managed_by_swrap);
+    if sudo(&t.ruser) {
+        return Ok((t.ruser.clone(), true));
+    }
+    accts.iter().find(|a| sudo(a) && has(a)).map(|a| (a.clone(), true)).ok_or_else(|| anyhow!("this needs root on {} (an AI grant for root, or an account with swrap-managed sudo)", t.host.label))
+}
+
+fn last_lines(s: &str, n: usize) -> String {
+    let v: Vec<&str> = s.lines().collect();
+    v[v.len().saturating_sub(n)..].join("\n")
+}
+
+/// update, inventory, reboot: fleet operations on one host, under the session's AI grant.
+fn ops_tool(d: &Arc<Daemon>, s: &Session, user: &User, name: &str, a: &Value) -> Result<ToolOut> {
+    if d.is_sealed() {
+        bail!("the swrap vault is sealed; host tools are unavailable until an admin logs in");
+    }
+    let t = resolve(d, s, user, a)?;
+    let label = t.host.label.clone();
+    let mut out = ToolOut { target: label.clone(), ruser: t.ruser.clone(), ..Default::default() };
+    let inventory = |ruser: &str| -> String {
+        let tg = crate::inventory::Target { host: t.host.clone(), ruser: ruser.to_string() };
+        let table = match crate::inventory::collect(d, &s.user, &label, vec![tg], None) {
+            Ok(r) => r.text.trim_end().to_string(),
+            Err(e) => format!("inventory failed: {e:#}"),
+        };
+        let conds = crate::inventory::conditions(d, &label);
+        let list = if conds.is_empty() { "none".to_string() } else { conds.iter().map(|c| format!("\n- {}: {}", c.kind, c.summary)).collect::<String>() };
+        format!("{table}\nopen conditions on {label} (what swrap raises tickets for): {list}\n")
+    };
+    match name {
+        "update" => {
+            let (ruser, sudo) = root_capable(d, user, &t)?;
+            out.ruser = ruser.clone();
+            let pkg = a["package"].as_str().map(str::trim).filter(|p| !p.is_empty());
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let con = Console { tx };
+            let r = crate::fleet::update_for_ai(d, &s.user, &t.host, &ruser, sudo, pkg, &s.id, &con);
+            drop(con);
+            let mut log = String::new();
+            while let Ok(f) = rx.try_recv() {
+                if f.kind == kind::STDOUT || f.kind == kind::STDERR {
+                    log.push_str(&String::from_utf8_lossy(&f.payload));
+                    log.push('\n');
+                }
+            }
+            let r = r?;
+            out.exit = Some(r.exit);
+            out.is_error = r.exit != 0;
+            out.text = format!("{}\n{}\n", last_lines(&log, 60), r.text.trim());
+            out.out = log.into_bytes();
+        }
+        "inventory" => out.text = inventory(&t.ruser),
+        "reboot" => {
+            if s.ticket == 0 {
+                bail!("reboot is only for the nightly ticket worker");
+            }
+            let c = crate::tickets::cfg(d);
+            if !c.reboot.contains(&label) {
+                bail!(
+                    "{label} is not on the nightly worker's reboot list ({}): a reboot there is for {} to decide; assign the ticket and say it is ready for a reboot",
+                    if c.reboot.is_empty() { "empty".to_string() } else { c.reboot.join(", ") },
+                    c.human_name
+                );
+            }
+            let (ruser, _) = root_capable(d, user, &t)?;
+            let (enc, _) = crate::session::credential(d, &label, &ruser).ok_or_else(|| anyhow!("no credential for {ruser}@{label}"))?;
+            let rt = Target { host: t.host.clone(), ruser: ruser.clone(), enc, profile: t.profile.clone(), known: t.known.clone() };
+            out.ruser = ruser.clone();
+            let boot = |tg: &Target| run_on(d, s, tg, "cat /proc/sys/kernel/random/boot_id", b"", Duration::from_secs(40)).ok().filter(|r| r.code == 0).map(|r| r.stdout.trim().to_string()).filter(|b| !b.is_empty());
+            let before = boot(&rt).ok_or_else(|| anyhow!("{label} does not answer; nothing was rebooted"))?;
+            // Scheduled a few seconds ahead, so this command returns before the host goes down.
+            let cmd = "S=''; [ \"$(id -u)\" = 0 ] || S='sudo -n'; $S systemd-run --quiet --on-active=5 --unit=swai-reboot-$(date +%s) \"$(command -v systemctl)\" reboot";
+            let r = run_on(d, s, &rt, cmd, b"", Duration::from_secs(60))?;
+            if r.code != 0 {
+                bail!("scheduling the reboot failed (exit {}): {}", r.code, r.stderr.trim());
+            }
+            d.audit_event(&s.user, "ai.reboot", &label, &ruser, "ok", json!({"reason": a["reason"], "ticket": s.ticket_no}), &s.id);
+            let t0 = Instant::now();
+            std::thread::sleep(Duration::from_secs(40));
+            let mut back = None;
+            while t0.elapsed() < Duration::from_secs(900) {
+                if boot(&rt).is_some_and(|b| b != before) {
+                    back = Some(t0.elapsed());
+                    break;
+                }
+                std::thread::sleep(Duration::from_secs(15));
+            }
+            match back {
+                Some(took) => out.text = format!("{label} rebooted and answered again after {}\n{}", fmt_duration_ms(took), inventory(&ruser)),
+                None => {
+                    out.is_error = true;
+                    out.text = format!("{label} is not back within PT15M after the reboot was scheduled (or it did not reboot: same boot id). This needs {}: assign the ticket.", c.human_name);
+                }
+            }
+        }
+        _ => unreachable!(),
+    }
+    Ok(out)
+}
+
 /// swrap's own records, with the user's rights (never admin): sessions, search, transcript.
 fn records_tool(d: &Arc<Daemon>, user: &User, name: &str, a: &Value) -> Result<ToolOut> {
     let c = Caller { uid: u32::MAX, pid: 0, name: user.name.clone(), user: Some(user.clone()), admin: false, origin: Node::Core };
@@ -1575,6 +1842,12 @@ enum Cmd {
     Approval { mode: String },
     /// Show the limits, or set one: swai limits [<key> <value>] (admin).
     Limits { key: Option<String>, value: Option<String> },
+    /// The nightly ticket worker (tickets in table assigned to claude): status | setup | adopt |
+    /// on | off | run [<ticket>] | set <key> <value> (admin; status also for its user).
+    Tickets {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -1598,6 +1871,21 @@ enum BackendCmd {
         /// Requests at once over all sessions (default: no limit); more wait their turn.
         #[arg(long)]
         max_concurrent: Option<u32>,
+        /// Context window to tell the harness (default: ask the server).
+        #[arg(long)]
+        context: Option<u64>,
+        /// Output tokens per request (default: from the context).
+        #[arg(long)]
+        max_output: Option<u64>,
+        /// The server's JSON status URL (no auth), shown with the backend; on_battery = paused.
+        #[arg(long)]
+        status_url: Option<String>,
+        /// Wait out 503/429 with Retry-After (UPS on battery, queue full) instead of failing.
+        #[arg(long)]
+        wait_unavailable: bool,
+        /// Parse tool calls in swrap from the raw output (llama.cpp): markup inside the reasoning stays text.
+        #[arg(long)]
+        raw_tools: bool,
     },
     /// Change a backend: swai backend set <name> [--timeout PT1H] [--models a,b] (admin).
     Set {
@@ -1610,6 +1898,21 @@ enum BackendCmd {
         /// Requests at once over all sessions (0 = no limit); applies at once.
         #[arg(long)]
         max_concurrent: Option<u32>,
+        /// Context window to tell the harness (0 = ask the server).
+        #[arg(long)]
+        context: Option<u64>,
+        /// Output tokens per request (0 = from the context).
+        #[arg(long)]
+        max_output: Option<u64>,
+        /// The server's JSON status URL ("" = none).
+        #[arg(long)]
+        status_url: Option<String>,
+        /// Wait out 503/429 with Retry-After: true or false.
+        #[arg(long)]
+        wait_unavailable: Option<bool>,
+        /// Parse tool calls in swrap from the raw output: true or false.
+        #[arg(long)]
+        raw_tools: Option<bool>,
     },
     Del { name: String },
     /// Store the backend's API key in the vault (read from stdin) (admin).
@@ -1639,7 +1942,7 @@ pub fn admin(d: &Arc<Daemon>, c: &Caller, argv: &[String], stdin: Option<zeroize
         Cmd::ResetCa => crate::ai_reset::set_ca(d, c, stdin),
         Cmd::Targets => {
             let user = ai_user(c)?;
-            let t = ai_hosts_text(d, user);
+            let t = ai_hosts_text(d, user, None);
             Ok(Resp::text(if t.is_empty() { "no hosts are enabled for AI for you (an admin runs: swai host <label> on; swai grant <you> <hosts> <accounts>)\n".into() } else { t }))
         }
         Cmd::Backend { cmd: BackendCmd::List } => {
@@ -1647,7 +1950,8 @@ pub fn admin(d: &Arc<Daemon>, c: &Caller, argv: &[String], stdin: Option<zeroize
             let mut s = String::from("NAME\tAPI\tURL\tSTATE\n");
             for b in &ai.backends {
                 let (ready, why) = backend_state(d, b);
-                s += &format!("{}\t{}\t{}\t{}\n", b.name, b.api.as_str(), b.base_url, if ready { "ready".to_string() } else { why });
+                let live = backend_live(b).map(|l| format!(" · {l}")).unwrap_or_default();
+                s += &format!("{}\t{}\t{}\t{}{live}\n", b.name, b.api.as_str(), b.base_url, if ready { "ready".to_string() } else { why });
             }
             Ok(Resp::text(s))
         }
@@ -1663,6 +1967,7 @@ pub fn admin(d: &Arc<Daemon>, c: &Caller, argv: &[String], stdin: Option<zeroize
             Ok(Resp::text(format!("{name}: /v1/models answered in {} with {} models\n{}\n", fmt_duration_ms(t0.elapsed()), list.len(), list.iter().filter_map(|m| m["id"].as_str()).collect::<Vec<_>>().join("\n"))))
         }
         Cmd::Kill { id } => kill(d, c, &id),
+        Cmd::Tickets { args } => crate::tickets::admin(d, c, &args, con),
         other => {
             c.require_admin()?;
             admin_write(d, c, other, stdin, con)
@@ -1673,7 +1978,7 @@ pub fn admin(d: &Arc<Daemon>, c: &Caller, argv: &[String], stdin: Option<zeroize
 fn admin_write(d: &Arc<Daemon>, c: &Caller, cmd: Cmd, stdin: Option<zeroize::Zeroizing<String>>, _con: &Console) -> Result<Resp> {
     let _g = d.config_lock.lock().unwrap();
     match cmd {
-        Cmd::Backend { cmd: BackendCmd::Add { name, base_url, api, key, models, timeout, max_concurrent } } => {
+        Cmd::Backend { cmd: BackendCmd::Add { name, base_url, api, key, models, timeout, max_concurrent, context, max_output, status_url, wait_unavailable, raw_tools } } => {
             IsoDuration::parse(&timeout).map_err(|e| anyhow!("--timeout: {e}"))?;
             if !name.bytes().all(|b| b.is_ascii_alphanumeric() || b"._:-".contains(&b)) || name.is_empty() {
                 bail!("bad backend name");
@@ -1692,13 +1997,13 @@ fn admin_write(d: &Arc<Daemon>, c: &Caller, cmd: Cmd, stdin: Option<zeroize::Zer
                 bail!("backend {name} exists");
             }
             let base = base_url.trim_end_matches('/').trim_end_matches("/v1").to_string();
-            ai.backends.push(AiBackend { name: name.clone(), api, base_url: base, models: models.map(|m| m.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect()).unwrap_or_default(), needs_key: key, timeout, max_concurrent: max_concurrent.unwrap_or(0), added_by: c.name.clone(), created: fmt_utc_secs(now()) });
+            ai.backends.push(AiBackend { name: name.clone(), api, base_url: base, models: models.map(|m| m.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect()).unwrap_or_default(), needs_key: key, timeout, max_concurrent: max_concurrent.unwrap_or(0), context: context.unwrap_or(0), max_output: max_output.unwrap_or(0), status_url: status_url.unwrap_or_default(), wait_unavailable, raw_tools, added_by: c.name.clone(), created: fmt_utc_secs(now()) });
             d.write_config("ai.toml", &ai.to_toml())?;
             d.commit(&format!("swai backend add {name} by {}", c.name))?;
             d.audit_event(&c.name, "ai.backend.add", &name, "", "ok", json!({"base_url": base_url}), "");
             Ok(Resp::text(format!("backend {name} added{}\n", if key { format!("; now store its key: swai backend key {name}") } else { String::new() })))
         }
-        Cmd::Backend { cmd: BackendCmd::Set { name, timeout, models, max_concurrent } } => {
+        Cmd::Backend { cmd: BackendCmd::Set { name, timeout, models, max_concurrent, context, max_output, status_url, wait_unavailable, raw_tools } } => {
             let mut ai = AiConfig::load(&d.paths)?;
             let b = ai.backends.iter_mut().find(|b| b.name == name).ok_or_else(|| anyhow!("unknown backend {name}"))?;
             if let Some(t) = timeout {
@@ -1711,12 +2016,38 @@ fn admin_write(d: &Arc<Daemon>, c: &Caller, cmd: Cmd, stdin: Option<zeroize::Zer
             if let Some(n) = max_concurrent {
                 b.max_concurrent = n;
             }
+            if let Some(n) = context {
+                b.context = n;
+            }
+            if let Some(n) = max_output {
+                b.max_output = n;
+            }
+            if let Some(u) = status_url {
+                if !u.is_empty() && !(u.starts_with("http://") || u.starts_with("https://")) {
+                    bail!("--status-url must start with http:// or https://");
+                }
+                b.status_url = u;
+            }
+            if let Some(w) = wait_unavailable {
+                b.wait_unavailable = w;
+            }
+            if let Some(r) = raw_tools {
+                if r && b.api != AiApi::Openai {
+                    bail!("--raw-tools needs an OpenAI-compatible llama.cpp server (--api openai)");
+                }
+                b.raw_tools = r;
+            }
             let summary = format!(
-                "{name}: timeout {} (new sessions), models {} (new sessions), at once {} (now)",
+                "{name}: timeout {} (new sessions), models {} (new sessions), at once {} (now), context {} / output {} (new sessions), status {}, wait when paused {} (new sessions)",
                 b.timeout,
                 if b.models.is_empty() { "any".to_string() } else { b.models.join(",") },
-                if b.max_concurrent == 0 { "unlimited".to_string() } else { b.max_concurrent.to_string() }
+                if b.max_concurrent == 0 { "unlimited".to_string() } else { b.max_concurrent.to_string() },
+                if b.context == 0 { "asked".to_string() } else { b.context.to_string() },
+                if b.max_output == 0 { "derived".to_string() } else { b.max_output.to_string() },
+                if b.status_url.is_empty() { "-" } else { &b.status_url },
+                if b.wait_unavailable { "yes" } else { "no" },
             );
+            let summary = format!("{summary}, tool calls parsed by {} (new sessions)", if b.raw_tools { "swrap" } else { "the server" });
             d.write_config("ai.toml", &ai.to_toml())?;
             d.commit(&format!("swai backend set {name} by {}", c.name))?;
             d.audit_event(&c.name, "ai.backend.set", &name, "", "ok", json!({}), "");
@@ -1856,7 +2187,8 @@ fn admin_write(d: &Arc<Daemon>, c: &Caller, cmd: Cmd, stdin: Option<zeroize::Zer
             let mut s = format!("opencode {} · Claude Code {}\n\nbackends:\n", opencode_version(), claude_version());
             for b in &ai.backends {
                 let (ready, why) = backend_state(d, b);
-                s += &format!("  {} ({}, {}) {}\n", b.name, b.api.as_str(), b.base_url, if ready { "ready" } else { &why });
+                let live = backend_live(b).map(|l| format!(" · {l}")).unwrap_or_default();
+                s += &format!("  {} ({}, {}) {}{live}\n", b.name, b.api.as_str(), b.base_url, if ready { "ready" } else { &why });
             }
             s += &format!("\ntool approval: {}\nhosts enabled for AI: ", ai.limits.approval);
             let on: Vec<String> = Host::all(&d.paths)?.into_iter().filter(|h| h.ai_allowed).map(|h| h.label).collect();
@@ -1873,7 +2205,7 @@ fn admin_write(d: &Arc<Daemon>, c: &Caller, cmd: Cmd, stdin: Option<zeroize::Zer
             }
             Ok(Resp::text(s))
         }
-        Cmd::Targets | Cmd::Reset { .. } | Cmd::ResetSetup { .. } | Cmd::ResetToken { .. } | Cmd::ResetCa | Cmd::Kill { .. } | Cmd::Backend { cmd: BackendCmd::List } | Cmd::Backend { cmd: BackendCmd::Test { .. } } => unreachable!(),
+        Cmd::Targets | Cmd::Reset { .. } | Cmd::ResetSetup { .. } | Cmd::ResetToken { .. } | Cmd::ResetCa | Cmd::Kill { .. } | Cmd::Tickets { .. } | Cmd::Backend { cmd: BackendCmd::List } | Cmd::Backend { cmd: BackendCmd::Test { .. } } => unreachable!(),
     }
 }
 
@@ -1882,13 +2214,49 @@ mod tests {
     use super::*;
 
     #[test]
+    fn backend_status_lines() {
+        // A UPS-aware gateway's /status, then on battery and throttling.
+        let mut v: Value = serde_json::from_str(r#"{"state":"ok","model":"ready","running":0,"queued":0,"ups":{"reachable":true,"on_battery":false,"mains_back_since_s":null},"gpu":{"temp_c":59,"mem_temp_c":57,"thermal_throttle":false}}"#).unwrap();
+        assert!(!status_paused(&v));
+        assert_eq!(live_summary(&v), "ok · model ready · 0 running, 0 queued · GPU 59 °C (HBM 57 °C)");
+        v["gpu"]["thermal_throttle"] = json!(true);
+        assert!(live_summary(&v).ends_with("THERMAL THROTTLING (slow)"));
+        v["state"] = json!("on_battery");
+        v["ups"]["on_battery"] = json!(true);
+        v["ups"]["mains_back_since_s"] = json!(20);
+        assert!(status_paused(&v));
+        assert_eq!(live_summary(&v), "ON UPS BATTERY: inference paused; mains back for PT20S (sessions wait for mains)");
+    }
+
+    #[test]
     fn handoff_is_offered_in_both_modes_and_explained() {
         for mode in ["host", "aaa"] {
-            let defs = tool_defs(mode);
+            let defs = tool_defs(mode, false);
             let h = defs.as_array().unwrap().iter().find(|t| t["name"] == "handoff").expect("handoff tool");
             assert_eq!(h["inputSchema"]["required"], json!(["briefing"]));
             assert!(h["description"].as_str().unwrap().contains("costs no budget"));
         }
         assert!(GUIDANCE.contains("call handoff with a complete briefing"));
+    }
+
+    #[test]
+    fn only_ticket_sessions_get_the_unattended_tools() {
+        let names = |mode: &str, ticket: bool| -> Vec<String> { tool_defs(mode, ticket).as_array().unwrap().iter().filter_map(|t| t["name"].as_str().map(String::from)).collect() };
+        for mode in ["host", "aaa"] {
+            let n = names(mode, false);
+            for t in ["update", "inventory", "reboot", "ticket", "ticket_result"] {
+                assert!(!n.iter().any(|x| x == t), "{mode} session offers {t}");
+            }
+        }
+        for mode in ["host", "aaa"] {
+            let n = names(mode, true);
+            for t in ["exec", "update", "inventory", "reboot", "ticket", "ticket_result", "handoff", "search", "transcript"] {
+                assert!(n.iter().any(|x| x == t), "{mode} ticket session lacks {t}");
+            }
+        }
+        assert!(!names("host", true).iter().any(|x| x == "hosts"));
+        assert!(!names("host", false).iter().any(|x| x == "search"));
+        let r = tool_defs("aaa", true).as_array().unwrap().iter().find(|t| t["name"] == "ticket_result").cloned().unwrap();
+        assert_eq!(r["inputSchema"]["properties"]["outcome"]["enum"], json!(["resolved", "report", "assign", "retry"]));
     }
 }

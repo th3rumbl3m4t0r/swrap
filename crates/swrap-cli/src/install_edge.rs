@@ -14,7 +14,7 @@ use swrap_core::atomic::{self, Owner};
 
 const LIBEXEC: &str = "/usr/libexec/swrap";
 const BINARIES: &[&str] = &["swrapd", "swrap", "swrap-shell", "swrap-pam-unlock", "swrec"];
-const LINKS: &[&str] = &["swrap", "sw", "swls", "swlog", "swcat", "swplay", "swsearch", "swupdate", "swinv", "swr", "swx", "swpasswd", "swunlock", "swadm", "swadd", "swenroll", "swdel", "swcrypto", "swfw"];
+const LINKS: &[&str] = &["swrap", "sw", "swls", "swlog", "swcat", "swplay", "swsearch", "swupdate", "swreload", "swinv", "swr", "swx", "swpasswd", "swunlock", "swadm", "swadd", "swenroll", "swdel", "swcrypto", "swfw"];
 const EDGE_ROOT: &str = "/var/lib/swrap-edge";
 
 fn sh(cmd: &str, args: &[&str]) -> Result<String> {

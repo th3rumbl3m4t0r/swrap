@@ -64,6 +64,7 @@ fn run(cmd: &str, args: Vec<String>) -> Result<i32> {
         "swcat" => swcat(args),
         "swplay" => swplay(args),
         "swupdate" => swupdate(args),
+        "swreload" => swreload(args),
         "swinv" => swinv(args),
         "swr" => swr(args),
         "swx" => swx(args),
@@ -292,6 +293,26 @@ fn swupdate(args: Vec<String>) -> Result<i32> {
         eprintln!("swrap: note: {targets:?} is also a file here; if you typed a wildcard, quote it");
     }
     let r = client::call(&Req::Update { targets, app: a.app })?;
+    Ok(client::finish(&r))
+}
+
+#[derive(Parser)]
+#[command(
+    name = "swreload",
+    about = "Reload systemd services on the hosts where you can act as root, so they run the code installed now; recorded as a run",
+    after_help = "Targets: a label, a wildcard ('web*'), @tag, @all, comma-separated lists, !label to exclude.\nOnly hosts where you can act as root count; quote wildcards so the shell leaves them alone.\nnginx: nginx -t, then a binary upgrade when it runs replaced code (no restart), else a reload.\nsshd: sshd -t, then a reload (sshd runs itself anew). Others: systemctl reload, never a restart.\nHosts without the service skip it. The hosts are inventoried again afterwards."
+)]
+struct SwreloadArgs {
+    /// Hosts: label, 'web*', @tag, @all, lists, !exclusions
+    targets: String,
+    /// Services (systemd units; .service may be left out), e.g. nginx sshd
+    #[arg(required = true)]
+    services: Vec<String>,
+}
+
+fn swreload(args: Vec<String>) -> Result<i32> {
+    let a = SwreloadArgs::try_parse_from(std::iter::once("swreload".to_string()).chain(args)).unwrap_or_else(|e| e.exit());
+    let r = client::call(&Req::Reload { targets: a.targets, services: a.services })?;
     Ok(client::finish(&r))
 }
 

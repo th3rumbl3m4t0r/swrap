@@ -1,16 +1,20 @@
 //! The `table` asset database as swrap's ticket sink and asset record.
 //!
 //! * **Tickets** only for actionable conditions, through a create-only form: per host, one
-//!   ticket when conditions appear (unreachable, reboot needed, security updates, unexpected
-//!   sudoers files, no asset record), nothing while they persist, a new one only after they
-//!   cleared and came back; other alerts (doctor, retention, clock) at most once per P7D each.
-//!   Tickets wait in a queue while table or the vault is unavailable.
+//!   ticket when conditions appear (unreachable, reboot needed, security fixes for or replaced
+//!   code in internet-exposed services, unexpected sudoers files, no asset record), nothing
+//!   while they persist, a new one only after they cleared and came back; the other security
+//!   fixes once a month while pending; other alerts (doctor, retention, clock) at most once per
+//!   P7D each. Tickets wait in a queue while table or the vault is unavailable.
 //! * **Assets**: after each inventory, every enrolled host's asset gets `aaa_label`,
 //!   `aaa_asimilated` and `aaa_running_projects` (active git repositories found on the host,
 //!   merged with hand-written lines, which are never changed). Hosts without one get one
 //!   through a create-only form.
 //! * **Endpoint agent**: a host without it gets it (its per-host forms made with the table admin
 //!   login, see `eagent`), when that login is in the vault.
+//! * **Fixed by swrap**: on internet hosts, nginx and sshd (`internet_reload`) get the security
+//!   fixes for what they run installed and are reloaded (`reload::autofix`) before their
+//!   conditions are looked at, so only what is still open then is ticketed.
 //!
 //! Form tokens and the admin password live in the vault (`keys/table/<name>.enc`), settings in
 //! `config/table.toml`.
@@ -54,6 +58,20 @@ pub struct TableCfg {
     /// `agent_endpoint_edge`, and get no agent while it is empty.
     pub agent_endpoint: String,
     pub agent_endpoint_edge: String,
+    /// Hosts reachable from the internet. Their internet-exposed services (sockets on a wildcard
+    /// or public address; on a host without a public address, every socket not on loopback) are
+    /// inventoried every `internet_every`, with fresh package metadata, and security fixes for
+    /// them or replaced code they still run are ticketed when found.
+    pub internet_hosts: Vec<String>,
+    pub internet_every: String,
+    /// On internet hosts, these services (program names, also their systemd units) are fixed by
+    /// swrap itself when internet-exposed: pending security fixes for their binary or a library
+    /// they use are installed and they are reloaded (`swreload`), also when they only still run
+    /// replaced code. At most once a day for the same finding; empty = tickets only.
+    pub internet_reload: Vec<String>,
+    /// Every other security fix: one ticket a month per host while fixes are pending, at its
+    /// first good inventory on or after this day of the month (UTC, 1-28).
+    pub security_day: u64,
 }
 
 impl Default for TableCfg {
@@ -72,12 +90,18 @@ impl Default for TableCfg {
             agent_script: "/usr/local/sbin/endpoint-agent.py".into(),
             agent_endpoint: String::new(),
             agent_endpoint_edge: String::new(),
+            internet_hosts: vec![],
+            internet_every: "PT1H".into(),
+            internet_reload: vec!["nginx".into(), "sshd".into()],
+            security_day: 1,
         }
     }
 }
 
 const TOKENS: [&str; 4] = ["ticket", "asset-read", "asset-update", "asset-create"];
 const REPEAT: i64 = 7 * 86400;
+/// Condition kinds ticketed once a month while present, not when they appear.
+const MONTHLY: [&str; 1] = ["security"];
 
 fn cfg_path(d: &Daemon) -> PathBuf {
     d.paths.config().join("table.toml")
@@ -91,8 +115,18 @@ fn token_path(d: &Daemon, which: &str) -> PathBuf {
     d.paths.vault_keys().join("table").join(format!("{which}.enc"))
 }
 
+/// Stores a form token (or the admin password) in the vault.
+pub fn store_token(d: &Daemon, which: &str, value: &str) -> Result<()> {
+    let p = token_path(d, which);
+    d.with_dek(|dek| swrap_vault::Vault::new(&d.paths, d.owner()).put(dek, &p, &format!("table-{which}"), value.as_bytes()))
+}
+
+pub fn has_token(d: &Daemon, which: &str) -> bool {
+    token_path(d, which).exists()
+}
+
 /// A form token from the vault; `None` if never set, an error while sealed.
-fn token(d: &Daemon, which: &str) -> Result<Option<zeroize::Zeroizing<String>>> {
+pub fn token(d: &Daemon, which: &str) -> Result<Option<zeroize::Zeroizing<String>>> {
     let p = token_path(d, which);
     if !p.exists() {
         return Ok(None);
@@ -134,6 +168,68 @@ fn check_admin(c: &TableCfg, user: &str, pass: &str) -> Result<()> {
     Ok(())
 }
 
+/// table ends an admin's previous session at each login: one admin session at a time (form
+/// provisioning here and in `eagent`).
+pub static ADMIN: Mutex<()> = Mutex::new(());
+
+/// A logged-in table admin session (the AAA admin login from the vault), logged out on drop.
+/// The password never leaves this process.
+pub struct AdminSession {
+    base: String,
+    cookie: String,
+    http: ureq::Agent,
+    _one: std::sync::MutexGuard<'static, ()>,
+}
+
+impl AdminSession {
+    pub fn open(d: &Daemon) -> Result<Self> {
+        use sha2::Digest;
+        let one = ADMIN.lock().unwrap_or_else(|p| p.into_inner());
+        let (user, pass) = admin_login(d)?.ok_or_else(|| anyhow!("no table admin password in the vault (`swrap table admin-password`)"))?;
+        let base = cfg(d).endpoint.trim_end_matches('/').to_string();
+        let http = crate::ai::http(Duration::from_secs(30));
+        let auth = zeroize::Zeroizing::new(format!("{:x}", sha2::Sha256::digest(format!("{user}:{}", pass.as_str()).as_bytes())));
+        let mut r = http.post(&format!("{base}/api/login")).header("Content-Type", "application/json").send(&serde_json::to_vec(&json!({"username": user, "auth": auth.as_str()}))?[..])?;
+        let st = r.status().as_u16();
+        let cookie = r.headers().get("set-cookie").and_then(|v| v.to_str().ok()).and_then(|v| v.split(';').next()).unwrap_or("").to_string();
+        let body = r.body_mut().read_to_string().unwrap_or_default();
+        if st != 200 || cookie.is_empty() {
+            bail!("table refused the login of {user} ({st}): {}", cut(&body, 200));
+        }
+        Ok(AdminSession { base, cookie, http, _one: one })
+    }
+
+    /// GET a JSON document; an error unless table answers 200.
+    pub fn get(&self, path: &str) -> Result<Value> {
+        let mut r = self.http.get(&format!("{}{path}", self.base)).header("Cookie", &self.cookie).call()?;
+        let st = r.status().as_u16();
+        let body = r.body_mut().read_to_string().unwrap_or_default();
+        if st != 200 {
+            bail!("table answered {st} to GET {path}: {}", cut(&body, 300));
+        }
+        Ok(serde_json::from_str(&body)?)
+    }
+
+    /// POST or PUT a JSON body: (status, body).
+    pub fn send(&self, method: &str, path: &str, body: &Value) -> Result<(u16, String)> {
+        let url = format!("{}{path}", self.base);
+        let data = serde_json::to_vec(body)?;
+        let req = match method {
+            "PUT" => self.http.put(&url),
+            _ => self.http.post(&url),
+        };
+        let mut r = req.header("Cookie", &self.cookie).header("Content-Type", "application/json").send(&data[..])?;
+        let st = r.status().as_u16();
+        Ok((st, r.body_mut().read_to_string().unwrap_or_default()))
+    }
+}
+
+impl Drop for AdminSession {
+    fn drop(&mut self) {
+        let _ = self.http.post(&format!("{}/api/logout", self.base)).header("Cookie", &self.cookie).send(&b""[..]);
+    }
+}
+
 // ---------------------------------------------------------------- state
 
 #[derive(Serialize, Deserialize, Default)]
@@ -150,6 +246,23 @@ struct State {
     auto_projects: BTreeMap<String, Vec<String>>,
     /// label → last automatic endpoint agent deployment (unix seconds).
     agent_tries: BTreeMap<String, i64>,
+    /// `<label>|<kind>` of the MONTHLY kinds → the month (YYYY-MM) last looked at.
+    monthly: BTreeMap<String, String>,
+    /// label → the last fix swrap made by itself on that internet host.
+    autofix: BTreeMap<String, Autofix>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Default)]
+struct Autofix {
+    /// `inventory::Fix::id` of what was found.
+    id: String,
+    packages: Vec<String>,
+    services: Vec<String>,
+    /// unix seconds
+    at: i64,
+    run: String,
+    /// `running`, `ok` or why not.
+    result: String,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -176,39 +289,90 @@ fn save_state(d: &Daemon, st: &State) {
 }
 
 /// One actionable condition of a host.
+#[derive(Default)]
 pub struct Condition {
     pub kind: &'static str,
     pub summary: String,
     pub detail: String,
+    /// Tells conditions of one kind apart, each ticketed once (its first word goes into the
+    /// ticket's title); empty when a kind has one.
+    pub id: String,
 }
 
-/// The host's actionable conditions now (inventory + asset sync). New ones → one ticket.
+/// The month (YYYY-MM, UTC) a monthly ticket at `t` belongs to: it starts on `day`.
+fn month_of(t: jiff::Timestamp, day: u64) -> String {
+    let z = t.to_zoned(jiff::tz::TimeZone::UTC);
+    let (y, m) = if (z.day() as u64) < day.clamp(1, 28) { if z.month() == 1 { (z.year() - 1, 12) } else { (z.year(), z.month() - 1) } } else { (z.year(), z.month()) };
+    format!("{y:04}-{m:02}")
+}
+
+/// The host's actionable conditions now (inventory + asset sync). New ones → one ticket; the
+/// MONTHLY kinds join it at the host's first good inventory of each month instead.
 pub fn host_conditions(d: &Daemon, label: &str, conds: Vec<Condition>) {
     let _g = STATE.lock().unwrap_or_else(|p| p.into_inner());
     let mut st = load_state(d);
-    let keys: BTreeSet<String> = conds.iter().map(|c| format!("{label}|{}", c.kind)).collect();
-    let prefix = format!("{label}|");
-    let cleared: Vec<String> = st.open.keys().filter(|k| k.starts_with(&prefix) && !keys.contains(*k)).cloned().collect();
+    let (cleared, ticket) = apply(&mut st, label, conds, &month_of(now(), cfg(d).security_day), &fmt_utc_secs(now()));
     for k in cleared {
-        st.open.remove(&k);
         d.audit_event("", "ticket.cleared", label, "", "ok", json!({"condition": k}), "");
     }
-    let fresh: Vec<&Condition> = conds.iter().filter(|c| !st.open.contains_key(&format!("{label}|{}", c.kind))).collect();
-    if !fresh.is_empty() {
-        let when = fmt_utc_secs(now());
-        for c in &fresh {
-            st.open.insert(format!("{label}|{}", c.kind), when.clone());
-        }
-        let short = format!("{label}: {}", fresh.iter().map(|c| c.summary.as_str()).collect::<Vec<_>>().join("; "));
-        let description = fresh.iter().map(|c| c.detail.as_str()).collect::<Vec<_>>().join("\n\n");
-        st.queue.push(Ticket {
-            short,
-            description,
-            worknotes: format!("Raised by swrap on the AAA core at {when} from its host inventory. swrap raises this again only after the condition has cleared and come back."),
-            label: label.to_string(),
-        });
-    }
+    st.queue.extend(ticket);
     save_state(d, &st);
+}
+
+/// `host_conditions` on the state: the keys of conditions that cleared, and the ticket for the
+/// new ones and the monthly ones due in `month`.
+fn apply(st: &mut State, label: &str, conds: Vec<Condition>, month: &str, when: &str) -> (Vec<String>, Option<Ticket>) {
+    let key = |c: &Condition| if c.id.is_empty() { format!("{label}|{}", c.kind) } else { format!("{label}|{}|{}", c.kind, c.id) };
+    let (monthly, conds): (Vec<Condition>, Vec<Condition>) = conds.into_iter().partition(|c| MONTHLY.contains(&c.kind));
+    for kind in MONTHLY {
+        // Ticketed under the old rule (when it appeared): this month's is done.
+        let k = format!("{label}|{kind}");
+        if st.open.remove(&k).is_some() && !st.monthly.contains_key(&k) {
+            st.monthly.insert(k, month.to_string());
+        }
+    }
+    let keys: BTreeSet<String> = conds.iter().map(key).collect();
+    let prefix = format!("{label}|");
+    let cleared: Vec<String> = st.open.keys().filter(|k| k.starts_with(&prefix) && !keys.contains(*k)).cloned().collect();
+    for k in &cleared {
+        st.open.remove(k);
+    }
+    let mut fresh: Vec<&Condition> = conds.iter().filter(|c| !st.open.contains_key(&key(c))).collect();
+    for c in &fresh {
+        st.open.insert(key(c), when.to_string());
+    }
+    // A month is looked at once, at the first good inventory in it: what appears later waits.
+    let mut month_due = false;
+    if !conds.iter().any(|c| c.kind == "unreachable") {
+        for kind in MONTHLY {
+            let k = format!("{label}|{kind}");
+            if st.monthly.get(&k).map(String::as_str) != Some(month) {
+                st.monthly.insert(k, month.to_string());
+                let due: Vec<&Condition> = monthly.iter().filter(|c| c.kind == kind).collect();
+                month_due |= !due.is_empty();
+                fresh.extend(due);
+            }
+        }
+    }
+    if fresh.is_empty() {
+        return (cleared, None);
+    }
+    let mut parts: Vec<String> = vec![];
+    for c in &fresh {
+        let ids: Vec<&str> = fresh.iter().filter(|x| x.kind == c.kind && !x.id.is_empty()).filter_map(|x| x.id.split(' ').next()).collect();
+        let s = if ids.is_empty() { c.summary.clone() } else { format!("{} ({})", c.summary, ids.join(", ")) };
+        if !parts.contains(&s) {
+            parts.push(s);
+        }
+    }
+    let monthly_note = if month_due { " Security fixes for services not exposed to the internet are raised once a month while they are pending." } else { "" };
+    let ticket = Ticket {
+        short: format!("{label}: {}", parts.join("; ")),
+        description: fresh.iter().map(|c| c.detail.as_str()).collect::<Vec<_>>().join("\n\n"),
+        worknotes: format!("Raised by swrap on the AAA core at {when} from its host inventory. swrap raises this again only after the condition has cleared and come back.{monthly_note}"),
+        label: label.to_string(),
+    };
+    (cleared, Some(ticket))
 }
 
 /// Alerts that are not per host (doctor, retention, clock): at most once per P7D each.
@@ -243,7 +407,12 @@ fn cut(s: &str, n: usize) -> String {
     if s.chars().count() <= n { s.to_string() } else { s.chars().take(n - 1).collect::<String>() + "…" }
 }
 
-fn post(d: &Daemon, path: &str, bearer: &str, body: &Value) -> Result<(u16, String)> {
+/// The swrap host label of a table asset (from the last asset sync).
+pub fn label_of_asset(d: &Daemon, asset: i64) -> Option<String> {
+    load_state(d).assets.into_iter().find(|(_, id)| *id == asset).map(|(l, _)| l)
+}
+
+pub(crate) fn post(d: &Daemon, path: &str, bearer: &str, body: &Value) -> Result<(u16, String)> {
     let c = cfg(d);
     let url = format!("{}{path}", c.endpoint.trim_end_matches('/'));
     let mut r = crate::ai::http(Duration::from_secs(20)).post(&url).header("Authorization", &format!("Bearer {bearer}")).header("Content-Type", "application/json").send(&serde_json::to_vec(body)?[..])?;
@@ -251,7 +420,7 @@ fn post(d: &Daemon, path: &str, bearer: &str, body: &Value) -> Result<(u16, Stri
     Ok((st, r.body_mut().read_to_string().unwrap_or_default()))
 }
 
-fn get(d: &Daemon, path: &str, bearer: &str) -> Result<Value> {
+pub(crate) fn get(d: &Daemon, path: &str, bearer: &str) -> Result<Value> {
     let c = cfg(d);
     let url = format!("{}{path}", c.endpoint.trim_end_matches('/'));
     let mut r = crate::ai::http(Duration::from_secs(20)).get(&url).header("Authorization", &format!("Bearer {bearer}")).call()?;
@@ -272,16 +441,27 @@ pub fn flush(d: &Daemon) -> Result<usize> {
     }
     let Some(tok) = token(d, "ticket")? else { return Ok(0) };
     let form = cfg(d).ticket_form;
+    // swrap's own tickets go to the ticket worker (`swai tickets`, at night) once its setup let
+    // the create form set the assignee.
+    let worker = crate::tickets::cfg(d);
+    let assignee = (worker.assign_new && worker.claude_id > 0).then_some(worker.claude_id);
     let mut sent = 0;
     while let Some(t) = st.queue.first().cloned() {
         let mut body = json!({"short_description": cut(&t.short, 200), "description": t.description, "status": "created", "worknotes": t.worknotes});
         if let Some(id) = st.assets.get(&t.label) {
             body["affected_asset"] = json!(id);
         }
+        if let Some(a) = assignee {
+            body["assignee"] = json!(a);
+        }
         match post(d, &format!("/api/form/{form}"), &tok, &body) {
             Ok((200, resp)) => {
                 let number = serde_json::from_str::<Value>(&resp).ok().and_then(|v| v.get("entry_id").cloned()).unwrap_or(Value::Null);
                 d.audit_event("", "ticket.created", &t.label, "", "ok", json!({"short": t.short, "entry": number}), "");
+                // Given to claude: the worker takes it at night, not as a person's assignment.
+                if let (Some(_), Some(id)) = (assignee, number.as_i64()) {
+                    crate::tickets::raised(d, id);
+                }
                 st.queue.remove(0);
                 sent += 1;
             }
@@ -585,9 +765,91 @@ fn agent_turn(d: &Daemon, label: &str) -> Option<i64> {
     Some(aid)
 }
 
+/// Whether swrap may upgrade the endpoint agent on `label` by itself now (at most once a day).
+fn upgrade_turn(d: &Daemon, label: &str) -> bool {
+    if !cfg(d).agent_auto {
+        return false;
+    }
+    let _g = STATE.lock().unwrap_or_else(|p| p.into_inner());
+    let mut st = load_state(d);
+    let t = now().as_second();
+    if st.agent_tries.get(label).is_some_and(|l| t - l < 86400) {
+        return false;
+    }
+    st.agent_tries.insert(label.to_string(), t);
+    save_state(d, &st);
+    true
+}
+
+/// Whether swrap may fix `label` by itself now: not the same finding within a day. Marks it.
+fn autofix_turn(d: &Daemon, label: &str, fix: &crate::inventory::Fix) -> bool {
+    let _g = STATE.lock().unwrap_or_else(|p| p.into_inner());
+    let mut st = load_state(d);
+    let t = now().as_second();
+    if st.autofix.get(label).is_some_and(|a| a.id == fix.id && t - a.at < 86400) {
+        return false;
+    }
+    let (packages, services) = (fix.packages.iter().cloned().collect(), fix.services.iter().cloned().collect());
+    st.autofix.insert(label.to_string(), Autofix { id: fix.id.clone(), packages, services, at: t, run: String::new(), result: "running".into() });
+    save_state(d, &st);
+    true
+}
+
+fn autofix_done(d: &Daemon, label: &str, run: &str, result: &str) {
+    let _g = STATE.lock().unwrap_or_else(|p| p.into_inner());
+    let mut st = load_state(d);
+    if let Some(a) = st.autofix.get_mut(label) {
+        a.run = run.to_string();
+        a.result = result.to_string();
+    }
+    save_state(d, &st);
+}
+
+/// Adds what swrap tried on `label` within the last day to the conditions it was about: fixes
+/// for the packages it installed (`<package> <version>`), services it reloaded (`<program>@<port>`).
+fn autofix_notes(d: &Daemon, label: &str, conds: &mut [Condition]) {
+    let st = load_state(d);
+    let Some(a) = st.autofix.get(label).filter(|a| now().as_second() - a.at < 86400) else { return };
+    let note = format!(
+        "\n\nswrap tried to fix this by itself at {} ({}reloading {}; run {}): {}.",
+        fmt_utc_secs(jiff::Timestamp::from_second(a.at).unwrap_or_else(|_| now())),
+        if a.packages.is_empty() { String::new() } else { format!("installing {}, ", a.packages.join(", ")) },
+        a.services.join(", "),
+        if a.run.is_empty() { "none" } else { &a.run },
+        a.result
+    );
+    for c in conds.iter_mut() {
+        let first = c.id.split([' ', '@']).next().unwrap_or("");
+        let about = match c.kind {
+            "internet-security" => a.packages.iter().any(|p| p == first),
+            "internet-restart" => a.services.iter().any(|s| s == first),
+            _ => false,
+        };
+        if about {
+            c.detail += &note;
+        }
+    }
+}
+
+/// Hosts whose inventory reports an endpoint agent older than this core's.
+fn outdated_agents(d: &Daemon) -> Vec<Host> {
+    let Some(core) = crate::eagent::core_version(&cfg(d)) else { return vec![] };
+    Host::all(&d.paths)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|h| h.state == HostState::Active)
+        .filter(|h| {
+            let f = std::fs::read_to_string(d.paths.state().join("hosts").join(&h.label).join("facts.toml")).ok().and_then(|t| toml::from_str::<toml::Value>(&t).ok());
+            let v = f.as_ref().and_then(|f| f.get("endpoint_agent")).and_then(|v| v.as_str()).unwrap_or("");
+            crate::eagent::outdated(v, &core)
+        })
+        .collect()
+}
+
 /// After an inventory: assets, then the hosts' actionable conditions, then send tickets. Hosts
 /// without the endpoint agent get it first, on a thread of their own (the inventory does not
-/// wait); their conditions follow when that is done.
+/// wait); their conditions follow when that is done. So do internet hosts swrap fixes by itself
+/// (`internet_reload`): inventoried again afterwards, which looks at their conditions anew.
 pub fn after_inventory(d: &Arc<Daemon>) {
     let missing = match sync_assets(d) {
         Ok((_, m)) => Some(m),
@@ -597,8 +859,14 @@ pub fn after_inventory(d: &Arc<Daemon>) {
         }
     };
     let mut later: Vec<(Host, i64, Vec<Condition>)> = vec![];
+    let mut fixes: Vec<(Host, crate::inventory::Fix)> = vec![];
     for h in Host::all(&d.paths).unwrap_or_default().into_iter().filter(|h| h.state == HostState::Active) {
+        if let Some(fix) = crate::inventory::internet_fix(d, &h.label).filter(|f| autofix_turn(d, &h.label, f)) {
+            fixes.push((h, fix));
+            continue;
+        }
         let mut conds = crate::inventory::conditions(d, &h.label);
+        autofix_notes(d, &h.label, &mut conds);
         if conds.iter().any(|c| c.kind == "agent") {
             if let Some(aid) = agent_turn(d, &h.label) {
                 later.push((h, aid, conds));
@@ -610,18 +878,46 @@ pub fn after_inventory(d: &Arc<Daemon>) {
                 kind: "no-asset",
                 summary: "no asset record in table".into(),
                 detail: format!("{} is enrolled in swrap ({}), but table has no asset for it (matched by aaa_label, IP address or hostname), and swrap could not create one (see `swrap table sync`). Create it, or set the asset-create token (`swrap table token asset-create`); the next inventory links them.", h.label, h.address),
+                ..Default::default()
             });
         }
         host_conditions(d, &h.label, conds);
     }
     let _ = flush(d);
-    if later.is_empty() {
+    let upgrades: Vec<Host> = outdated_agents(d).into_iter().filter(|h| !later.iter().any(|(l, _, _)| l.label == h.label) && upgrade_turn(d, &h.label)).collect();
+    if later.is_empty() && upgrades.is_empty() && fixes.is_empty() {
         return;
     }
     let d = d.clone();
     let rt = tokio::runtime::Handle::try_current().ok();
     std::thread::spawn(move || {
         let _e = rt.as_ref().map(|r| r.enter());
+        let mut again = vec![];
+        for (h, fix) in fixes {
+            let (run, result) = match crate::reload::autofix(&d, &h, &fix) {
+                Ok(r) => r,
+                Err(e) => (String::new(), format!("{e:#}")),
+            };
+            if result != "ok" {
+                eprintln!("swrapd: fixing {} by itself ({}): {result}", h.label, fix.id);
+            }
+            autofix_done(&d, &h.label, &run, &result);
+            if let Some(ruser) = crate::inventory::system_account(&d, &h) {
+                again.push(crate::inventory::Target { host: h, ruser });
+            }
+        }
+        if !again.is_empty() {
+            // Its conditions follow from this inventory (the same finding is not tried again today).
+            let labels: Vec<String> = again.iter().map(|t| t.host.label.clone()).collect();
+            if let Err(e) = crate::inventory::collect(&d, "swrap", &labels.join(","), again, None) {
+                eprintln!("swrapd: inventory after fixing {}: {e:#}", labels.join(", "));
+            }
+        }
+        for h in upgrades {
+            if let Err(e) = crate::eagent::upgrade(&d, "swrap", &h, &Console::null()) {
+                eprintln!("swrapd: endpoint agent upgrade on {}: {e:#}", h.label);
+            }
+        }
         for (h, aid, mut conds) in later {
             match crate::eagent::deploy(&d, "swrap", &h, aid, &Console::null()) {
                 Ok(_) => conds.retain(|c| c.kind != "agent"),
@@ -640,7 +936,7 @@ pub fn after_inventory(d: &Arc<Daemon>) {
 
 // ---------------------------------------------------------------- admin
 
-/// `swrap table status | token <name> | admin-password | agent <label> | sync | test-ticket | set <key> <value>`
+/// `swrap table status | token <name> | admin-password | agent <label> | agent-upgrade <label|all> | sync | test-ticket | set <key> <value>`
 pub fn admin(d: &Arc<Daemon>, c: &Caller, argv: &[String], stdin: Option<zeroize::Zeroizing<String>>, con: &Console) -> Result<Resp> {
     c.require_admin()?;
     let a: Vec<&str> = argv.iter().skip(1).map(String::as_str).collect();
@@ -659,6 +955,16 @@ pub fn admin(d: &Arc<Daemon>, c: &Caller, argv: &[String], stdin: Option<zeroize
                 if c2.agent_endpoint.is_empty() { &c2.endpoint } else { &c2.agent_endpoint },
                 if c2.agent_endpoint_edge.is_empty() { "(not set: no automatic agent)" } else { &c2.agent_endpoint_edge }
             );
+            t += &format!(
+                "  security fixes: internet hosts {} (inventoried every {}; {}exposed services ticketed when found) · the rest once a month, from day {} (UTC)\n",
+                if c2.internet_hosts.is_empty() { "(none)".to_string() } else { c2.internet_hosts.join(", ") },
+                c2.internet_every,
+                if c2.internet_reload.is_empty() { String::new() } else { format!("{} fixed and reloaded by swrap, other ", c2.internet_reload.join(", ")) },
+                c2.security_day.clamp(1, 28)
+            );
+            for (l, a) in &st.autofix {
+                t += &format!("    fixed by swrap: {l} at {} (run {}): {} · {}\n", fmt_utc_secs(jiff::Timestamp::from_second(a.at).unwrap_or_else(|_| now())), a.run, a.result, a.id);
+            }
             t += &format!("  queued tickets: {} · open host conditions: {} · assets known: {}\n", st.queue.len(), st.open.len(), st.assets.len());
             for (k, since) in &st.open {
                 t += &format!("    {k} since {since}\n");
@@ -701,6 +1007,24 @@ pub fn admin(d: &Arc<Daemon>, c: &Caller, argv: &[String], stdin: Option<zeroize
             };
             Ok(Resp::text(crate::eagent::deploy(d, &c.name, &h, aid, con)?))
         }
+        ["agent-upgrade", target] => {
+            let hosts: Vec<Host> = if *target == "all" {
+                outdated_agents(d)
+            } else {
+                vec![Host::all(&d.paths)?.into_iter().find(|h| h.label == *target && h.state == HostState::Active).ok_or_else(|| anyhow!("no active host {target}"))?]
+            };
+            if hosts.is_empty() {
+                return Ok(Resp::text(format!("every host runs endpoint agent {}\n", crate::eagent::core_version(&cfg(d)).unwrap_or_default())));
+            }
+            let mut t = String::new();
+            for h in hosts {
+                t += &match crate::eagent::upgrade(d, &c.name, &h, con) {
+                    Ok(r) => r,
+                    Err(e) => format!("{}: {e:#}\n", h.label),
+                };
+            }
+            Ok(Resp::text(t))
+        }
         ["sync"] => {
             let (r, _) = sync_assets(d)?;
             Ok(Resp::text(if r.is_empty() { "assets up to date\n".to_string() } else { r + "\n" }))
@@ -735,13 +1059,60 @@ pub fn admin(d: &Arc<Daemon>, c: &Caller, argv: &[String], stdin: Option<zeroize
             d.commit(&format!("table: {key} = {value} ({})", c.name))?;
             Ok(Resp::text(format!("{key} set\n")))
         }
-        _ => bail!("usage: swrap table status | token <ticket|asset-read|asset-update|asset-create> (stdin) | admin-password (stdin) | agent <label> | sync | test-ticket | set <key> <value>"),
+        _ => bail!("usage: swrap table status | token <ticket|asset-read|asset-update|asset-create> (stdin) | admin-password (stdin) | agent <label> | agent-upgrade <label|all> | sync | test-ticket | set <key> <value>"),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn cond(kind: &'static str, id: &str) -> Condition {
+        Condition { kind, summary: format!("{kind} summary"), detail: format!("{kind} {id} detail"), id: id.into() }
+    }
+
+    #[test]
+    fn months_start_on_the_security_day() {
+        let t = |s: &str| s.parse::<jiff::Timestamp>().unwrap();
+        assert_eq!(month_of(t("2026-10-01T00:10:00Z"), 1), "2026-10");
+        assert_eq!(month_of(t("2026-10-14T23:59:00Z"), 15), "2026-09");
+        assert_eq!(month_of(t("2026-10-15T00:00:00Z"), 15), "2026-10");
+        assert_eq!(month_of(t("2026-01-03T00:00:00Z"), 5), "2025-12");
+        assert_eq!(month_of(t("2026-02-28T12:00:00Z"), 31), "2026-02");
+    }
+
+    #[test]
+    fn internet_fixes_at_once_the_rest_monthly() {
+        let mut st = State::default();
+        // Old rule: the host's security fixes were ticketed when they appeared.
+        st.open.insert("h|security".into(), "2026-10-02T07:01:47Z".into());
+        let (_, t) = apply(&mut st, "h", vec![cond("security", "")], "2026-10", "T1");
+        assert!(t.is_none(), "already ticketed this month");
+        assert!(!st.open.contains_key("h|security"));
+        // An internet-exposed fix: at once, again for a newer fix, not while it stays.
+        let (_, t) = apply(&mut st, "h", vec![cond("security", ""), cond("internet-security", "nginx 1.26.3-4")], "2026-10", "T2");
+        let t = t.unwrap();
+        assert_eq!(t.short, "h: internet-security summary (nginx)");
+        assert!(!t.description.contains("security  detail"));
+        assert!(apply(&mut st, "h", vec![cond("security", ""), cond("internet-security", "nginx 1.26.3-4")], "2026-10", "T3").1.is_none());
+        let t = apply(&mut st, "h", vec![cond("internet-security", "nginx 1.26.3-4"), cond("internet-security", "nginx 1.26.3-5"), cond("internet-restart", "sshd@tcp/22")], "2026-10", "T4").1.unwrap();
+        assert_eq!(t.short, "h: internet-security summary (nginx); internet-restart summary (sshd@tcp/22)");
+        // Next month: the other fixes once, with the note; not again that month.
+        let t = apply(&mut st, "h", vec![cond("security", "")], "2026-11", "T5");
+        let (cleared, t) = (t.0, t.1.unwrap());
+        assert_eq!(t.short, "h: security summary");
+        assert!(t.worknotes.contains("once a month"));
+        assert_eq!(cleared.len(), 3);
+        assert!(apply(&mut st, "h", vec![cond("security", "")], "2026-11", "T6").1.is_none());
+        // A month with nothing pending at its first inventory: what appears later waits.
+        assert!(apply(&mut st, "h", vec![], "2026-12", "T7").1.is_none());
+        assert!(apply(&mut st, "h", vec![cond("security", "")], "2026-12", "T8").1.is_none());
+        // An unreachable host does not use up its month.
+        assert!(apply(&mut st, "h", vec![cond("unreachable", "")], "2027-01", "T9").1.is_some());
+        assert_ne!(st.monthly.get("h|security").map(String::as_str), Some("2027-01"));
+        let t = apply(&mut st, "h", vec![cond("security", "")], "2027-01", "T10").1.unwrap();
+        assert_eq!(t.short, "h: security summary");
+    }
 
     #[test]
     fn git_names_and_links() {

@@ -14,7 +14,7 @@ use swrap_core::Paths;
 const LIBEXEC: &str = "/usr/libexec/swrap";
 const BINARIES: &[&str] = &["swrapd", "swrap", "swrap-shell", "swrap-pam-unlock", "swrec", "swrap-web"];
 const LINKS: &[&str] = &[
-    "swrap", "sw", "swai", "swls", "swlog", "swcat", "swplay", "swsearch", "swupdate", "swinv", "swr", "swx", "swpasswd", "swunlock", "swadm", "swadd", "swenroll", "swdel", "swuser", "swrotate", "swcrypto", "swfw", "swedge", "swrap-install",
+    "swrap", "sw", "swai", "swls", "swlog", "swcat", "swplay", "swsearch", "swupdate", "swreload", "swinv", "swr", "swx", "swpasswd", "swunlock", "swadm", "swadd", "swenroll", "swdel", "swuser", "swrotate", "swcrypto", "swfw", "swedge", "swrap-install",
 ];
 
 /// Documentation shipped inside the binary, so every node (and every edge deploy) has it.
@@ -215,7 +215,11 @@ WantedBy=timers.target
 const WEB_SERVICE: &str = r#"[Unit]
 Description=swrap web GUI (playback and search)
 After=swrapd.service network-online.target
+Wants=network-online.target
 RequiresMountsFor=/var/lib/swrap
+# web.bind names this host's address, which can come minutes after boot (DHCP);
+# keep retrying instead of giving up after five quick failures.
+StartLimitIntervalSec=0
 
 [Service]
 ExecStart=/usr/libexec/swrap/swrap-web
@@ -231,6 +235,7 @@ PrivateTmp=yes
 ReadOnlyPaths=/var/lib/swrap
 ReadWritePaths=/run/swrap
 Restart=on-failure
+RestartSec=5
 LimitCORE=0
 Slice=swrap.slice
 

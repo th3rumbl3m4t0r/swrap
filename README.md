@@ -63,6 +63,7 @@ Admins, additionally:
 
 ```
 swadd --host <addr> --label <l>    then paste the snippet on the host, then:  swenroll <l>
+swadd --host <addr> --label <l> --via <host> --from <ip>   a host reachable only through another enrolled host (ssh jump; one hop)
 swdel <l> [--purge]                swcrypto test
 swadm user add|del|list|disable|enable <u> [--admin] [--key '…']
 swadm key add|del|list <u> …       swadm grant <u> <hosts> <rusers> [--via core,edge] [--for PT8H]

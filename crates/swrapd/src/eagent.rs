@@ -4,20 +4,18 @@
 //! admin-password`, kept in the vault) through the agent's own `--provision-env` on this node,
 //! then installs the agent with that env on the host, like `swr`: the env goes on stdin and is
 //! redacted from the output, so no form secret lands in a recording. The admin login never
-//! leaves the core.
+//! leaves the core. Hosts running an older agent get this core's script (`upgrade`): only the
+//! script, their env, forms and units stay.
 
 use crate::daemon::{Console, Daemon};
 use crate::table::TableCfg;
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::json;
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 use swrap_core::api::SecretEnv;
 use swrap_core::config::{Host, Route};
-
-/// table ends an admin's previous session at each login: one provisioning at a time.
-static ONE: Mutex<()> = Mutex::new(());
 
 const INSTALL_TIMEOUT: Duration = Duration::from_secs(900);
 
@@ -35,7 +33,8 @@ pub fn host_endpoint(c: &TableCfg, h: &Host) -> Result<String> {
 /// Create (or align) the table forms of asset `aid` for `h` and install the agent there. Forms
 /// that exist get new secrets, so this also rotates a host's agent secrets.
 pub fn deploy(d: &Arc<Daemon>, who: &str, h: &Host, aid: i64, con: &Console) -> Result<String> {
-    let _g = ONE.lock().unwrap_or_else(|p| p.into_inner());
+    // One table admin session at a time (table ends the previous one at each login).
+    let _g = crate::table::ADMIN.lock().unwrap_or_else(|p| p.into_inner());
     let c = crate::table::cfg(d);
     let (user, pass) = crate::table::admin_login(d)?.ok_or_else(|| anyhow!("no table admin password in the vault (`swrap table admin-password`)"))?;
     let endpoint = host_endpoint(&c, h)?;
@@ -85,14 +84,47 @@ pub fn deploy(d: &Arc<Daemon>, who: &str, h: &Host, aid: i64, con: &Console) -> 
     Ok(format!("{}: endpoint agent installed with {n} table forms of its own (asset #{aid}); run {run}\n", h.label))
 }
 
+/// The version of the agent this core installs (`AGENT_VERSION` in `agent_script`).
+pub fn core_version(c: &TableCfg) -> Option<String> {
+    let s = std::fs::read_to_string(&c.agent_script).ok()?;
+    s.lines().find_map(|l| l.strip_prefix("AGENT_VERSION = \"")).and_then(|r| r.split('"').next()).map(String::from)
+}
+
+/// Whether the agent a host reports (inventory: `1.2 enabled`, `unknown enabled`, `none`) is
+/// older than `core`; `unknown` (its `--version` failed) counts as older.
+pub fn outdated(reported: &str, core: &str) -> bool {
+    let v = reported.split_whitespace().next().unwrap_or("");
+    let parse = |s: &str| s.split('.').map(|x| x.parse::<u32>().ok()).collect::<Option<Vec<_>>>();
+    match (parse(v), parse(core)) {
+        (Some(h), Some(c)) => h < c,
+        (None, Some(_)) => v == "unknown",
+        _ => false,
+    }
+}
+
+/// Replace the agent on `h` with this core's: the script only (checked to run there first),
+/// then a refresh of its records with it.
+pub fn upgrade(d: &Arc<Daemon>, who: &str, h: &Host, con: &Console) -> Result<String> {
+    let c = crate::table::cfg(d);
+    let ruser = crate::inventory::system_account(d, h).ok_or_else(|| anyhow!("no account with a credential on {}", h.label))?;
+    let agent = std::fs::read(&c.agent_script).with_context(|| format!("read {}", c.agent_script))?;
+    let version = core_version(&c).unwrap_or_default();
+    let script = upgrade_script(&agent);
+    let (run, code, result, detail) = crate::fleet::system_job(d, who, "agent", h, &ruser, "endpoint-agent upgrade", script.as_bytes(), &[], &[], INSTALL_TIMEOUT, con)?;
+    d.audit_event(who, "table.agent_upgraded", &h.label, &ruser, if result == "ok" { "ok" } else { "failed" }, json!({"version": version, "run": run, "exit": code}), &run);
+    if result != "ok" {
+        bail!("upgrading the agent failed ({result}, exit {code}{}); see run {run}", if detail.is_empty() { String::new() } else { format!(": {detail}") });
+    }
+    Ok(format!("{}: endpoint agent {version} installed; run {run}\n", h.label))
+}
+
 fn last_lines(s: &str, n: usize) -> String {
     let v: Vec<&str> = s.lines().filter(|l| !l.trim().is_empty()).collect();
     v[v.len().saturating_sub(n)..].join("\n")
 }
 
-/// Root on the host: the env from $EA_ENV, the agent (checksummed), then `--install` (systemd
-/// units and a first update that proves the form secrets work).
-fn install_script(agent: &[u8]) -> String {
+/// The agent's sha256 and its base64 in 76-column lines (for a here-document).
+fn payload(agent: &[u8]) -> (String, String) {
     use base64::Engine;
     use sha2::Digest;
     let sha = format!("{:x}", sha2::Sha256::digest(agent));
@@ -102,6 +134,40 @@ fn install_script(agent: &[u8]) -> String {
         wrapped.push_str(std::str::from_utf8(chunk).unwrap_or_default());
         wrapped.push('\n');
     }
+    (sha, wrapped)
+}
+
+/// Root on the host: the agent (checksummed, and run once before it replaces the old one),
+/// its listening services as a check, then a refresh in the background.
+fn upgrade_script(agent: &[u8]) -> String {
+    let (sha, wrapped) = payload(agent);
+    format!(
+        r#"#!/bin/bash
+# endpoint-agent upgrade by swrap (agent {sha16}): the script only
+set -euo pipefail
+F=/usr/local/sbin/endpoint-agent.py
+[ -s /etc/endpoint-agent/env ] || {{ echo "no /etc/endpoint-agent/env: the agent was never provisioned here"; exit 3; }}
+command -v python3 >/dev/null || {{ echo "python3 is missing"; exit 3; }}
+echo "== was $(python3 $F --version 2>&1 | tail -1)"
+umask 022
+base64 -d > $F.new <<'B64'
+{wrapped}B64
+[ "$(sha256sum $F.new | cut -d' ' -f1)" = "{sha}" ] || {{ echo "checksum mismatch"; rm -f $F.new; exit 1; }}
+v=$(python3 $F.new --version 2>&1) || {{ echo "the new agent does not run here: $(printf '%s' "$v" | tail -3)"; rm -f $F.new; exit 4; }}
+chmod 755 $F.new && chown root:root $F.new && mv -f $F.new $F
+restorecon $F 2>/dev/null || true
+echo "== agent $($F --version) $(sha256sum $F | cut -c1-16)"
+$F --services 2>&1 | cut -c1-200 | head -60
+systemctl start --no-block endpoint-agent.service 2>/dev/null || true
+"#,
+        sha16 = &sha[..16],
+    )
+}
+
+/// Root on the host: the env from $EA_ENV, the agent (checksummed), then `--install` (systemd
+/// units and a first update that proves the form secrets work).
+fn install_script(agent: &[u8]) -> String {
+    let (sha, wrapped) = payload(agent);
     format!(
         r#"#!/bin/bash
 # endpoint-agent install by swrap (agent {sha16})
@@ -142,5 +208,20 @@ mod tests {
         let b64: String = s.split("<<'B64'\n").nth(1).unwrap().split("B64\n").next().unwrap().lines().collect();
         assert_eq!(base64::engine::general_purpose::STANDARD.decode(b64).unwrap(), agent);
         assert!(!s.contains("ASSET_ADMIN"));
+        let u = upgrade_script(&agent);
+        let b64: String = u.split("<<'B64'\n").nth(1).unwrap().split("B64\n").next().unwrap().lines().collect();
+        assert_eq!(base64::engine::general_purpose::STANDARD.decode(b64).unwrap(), agent);
+        assert!(!u.contains("EA_ENV"));
+    }
+
+    #[test]
+    fn outdated_agents() {
+        assert!(outdated("1.2 enabled", "1.3"));
+        assert!(outdated("1.2 not-found", "1.10"));
+        assert!(outdated("unknown enabled", "1.3"));
+        assert!(!outdated("1.3 enabled", "1.3"));
+        assert!(!outdated("1.4 enabled", "1.3"));
+        assert!(!outdated("none", "1.3"));
+        assert!(!outdated("", "1.3"));
     }
 }

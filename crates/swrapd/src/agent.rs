@@ -9,6 +9,10 @@
 //!   user, at most N times within the window.
 //!
 //! Everything else is refused. Every decision is audited.
+//!
+//! A host reached through another (`via`, a jump) adds a second hop: the jump host's key, user and
+//! pinned host keys. Each agent connection binds to one hop (its session-bind picks the hop by
+//! host key), sees only that hop's key, and each hop binds once.
 
 use crate::daemon::Daemon;
 use anyhow::{bail, Context, Result};
@@ -44,6 +48,31 @@ pub struct Policy {
     pub max_sigs: u32,
     pub window: Duration,
     pub require_hostbound: bool,
+    /// The jump host's leg, for hosts reached `via` another one.
+    pub jump: Option<Hop>,
+}
+
+/// One leg of a connection: whose key, for which account, against which pinned host keys.
+#[derive(Clone, Debug)]
+pub struct Hop {
+    pub label: String,
+    pub ruser: String,
+    pub key_blob: Vec<u8>,
+    pub pinned: Vec<Vec<u8>>,
+}
+
+impl Policy {
+    /// Hop 0 is the target, hop 1 the jump (if any).
+    fn hop(&self, i: usize) -> Option<(&str, &str, &[u8], &[Vec<u8>])> {
+        match (i, &self.jump) {
+            (0, _) => Some((&self.label, &self.ruser, &self.key_blob, &self.pinned)),
+            (1, Some(j)) => Some((&j.label, &j.ruser, &j.key_blob, &j.pinned)),
+            _ => None,
+        }
+    }
+    fn hops(&self) -> usize {
+        1 + self.jump.is_some() as usize
+    }
 }
 
 pub struct SessionAgent {
@@ -151,10 +180,12 @@ enum Verdict {
 
 struct State {
     started: Instant,
-    bound_session: Option<Vec<u8>>,
+    /// The session id each hop is bound to.
+    bound: [Option<Vec<u8>>; 2],
 }
 
-fn check_bind(p: &Policy, body: &[u8], st: &mut State) -> Verdict {
+/// session-bind: the host key picks the hop (and binds this connection to it); once per hop.
+fn check_bind(p: &Policy, body: &[u8], st: &mut State, conn: &mut Option<usize>) -> Verdict {
     let mut r = Rd { b: body };
     let (Some(_name), Some(hostkey), Some(sid), Some(_sig), Some(fwd)) = (r.string(), r.string(), r.string(), r.string(), r.u8()) else {
         return Verdict::Deny("malformed session-bind".into());
@@ -162,17 +193,30 @@ fn check_bind(p: &Policy, body: &[u8], st: &mut State) -> Verdict {
     if fwd != 0 {
         return Verdict::Deny("session-bind for forwarding refused".into());
     }
-    if !p.pinned.iter().any(|k| k.as_slice() == hostkey) {
+    let Some(i) = (0..p.hops()).find(|&i| p.hop(i).map(|h| h.3.iter().any(|k| k.as_slice() == hostkey)).unwrap_or(false)) else {
         return Verdict::Deny(format!("session-bind host key {} is not pinned for {}", blob_fp(hostkey), p.label));
-    }
-    if st.bound_session.is_some() {
+    };
+    if st.bound[i].is_some() || conn.is_some() {
         return Verdict::Deny("session already bound".into());
     }
-    st.bound_session = Some(sid.to_vec());
+    st.bound[i] = Some(sid.to_vec());
+    *conn = Some(i);
     Verdict::Allow
 }
 
-fn check_sign(p: &Policy, body: &[u8], st: &State, count: u32) -> Verdict {
+/// The hop a sign request is for: the connection's bound hop, else the one holding that key.
+fn sign_hop(p: &Policy, body: &[u8], conn: Option<usize>) -> usize {
+    if let Some(i) = conn {
+        return i;
+    }
+    let mut r = Rd { b: body };
+    let key = r.string().unwrap_or_default();
+    (0..p.hops()).find(|&i| p.hop(i).map(|h| h.2 == key).unwrap_or(false)).unwrap_or(0)
+}
+
+fn check_sign(p: &Policy, body: &[u8], st: &State, count: u32, conn: Option<usize>) -> Verdict {
+    let i = sign_hop(p, body, conn);
+    let Some((_, ruser, key_blob, pinned)) = p.hop(i) else { return Verdict::Deny("no such hop".into()) };
     if count >= p.max_sigs {
         return Verdict::Deny(format!("signature limit {} reached", p.max_sigs));
     }
@@ -181,7 +225,7 @@ fn check_sign(p: &Policy, body: &[u8], st: &State, count: u32) -> Verdict {
     }
     let mut r = Rd { b: body };
     let (Some(key), Some(data)) = (r.string(), r.string()) else { return Verdict::Deny("malformed sign request".into()) };
-    if key != p.key_blob.as_slice() {
+    if key != key_blob {
         return Verdict::Deny("sign request for a foreign key".into());
     }
     let mut d = Rd { b: data };
@@ -192,8 +236,8 @@ fn check_sign(p: &Policy, body: &[u8], st: &State, count: u32) -> Verdict {
     let (Some(user), Some(service), Some(method)) = (d.string(), d.string(), d.string()) else {
         return Verdict::Deny("malformed userauth request".into());
     };
-    if user != p.ruser.as_bytes() {
-        return Verdict::Deny(format!("userauth for {:?}, expected {:?}", String::from_utf8_lossy(user), p.ruser));
+    if user != ruser.as_bytes() {
+        return Verdict::Deny(format!("userauth for {:?}, expected {:?}", String::from_utf8_lossy(user), ruser));
     }
     if service != b"ssh-connection" {
         return Verdict::Deny("unexpected service".into());
@@ -206,19 +250,19 @@ fn check_sign(p: &Policy, body: &[u8], st: &State, count: u32) -> Verdict {
         return Verdict::Deny("not a signature request".into());
     }
     let (Some(_alg), Some(kb)) = (d.string(), d.string()) else { return Verdict::Deny("malformed userauth request".into()) };
-    if kb != p.key_blob.as_slice() {
+    if kb != key_blob {
         return Verdict::Deny("userauth key mismatch".into());
     }
     if hostbound_method {
         let Some(hk) = d.string() else { return Verdict::Deny("hostbound request without host key".into()) };
-        if !p.pinned.iter().any(|k| k.as_slice() == hk) {
+        if !pinned.iter().any(|k| k.as_slice() == hk) {
             return Verdict::Deny("hostbound request for an unpinned host key".into());
         }
     }
     if !d.b.is_empty() {
         return Verdict::Deny("trailing data in userauth request".into());
     }
-    match &st.bound_session {
+    match &st.bound[i] {
         Some(b) if b.as_slice() != sid => return Verdict::Deny("session id differs from the bound session".into()),
         None if p.require_hostbound => return Verdict::Deny("session not host-bound (require_hostbound)".into()),
         _ => {}
@@ -231,6 +275,12 @@ fn check_sign(p: &Policy, body: &[u8], st: &State, count: u32) -> Verdict {
 impl SessionAgent {
     /// Start the real agent (root-only socket), load the key, and serve the proxy socket.
     pub fn start(d: Arc<Daemon>, policy: Policy, private_key: Zeroizing<Vec<u8>>, session_dir: &Path) -> Result<Arc<Self>> {
+        Self::start_with_jump(d, policy, private_key, None, session_dir)
+    }
+
+    /// `start` for a host reached through a jump: the agent also holds the jump leg's key
+    /// (`policy.jump` says what it may sign).
+    pub fn start_with_jump(d: Arc<Daemon>, policy: Policy, private_key: Zeroizing<Vec<u8>>, jump_key: Option<Zeroizing<Vec<u8>>>, session_dir: &Path) -> Result<Arc<Self>> {
         let real_dir = d.paths.run.join("agents").join(&policy.session_id);
         std::fs::create_dir_all(&real_dir)?;
         std::fs::set_permissions(&real_dir, std::fs::Permissions::from_mode(0o700))?;
@@ -251,20 +301,22 @@ impl SessionAgent {
             }
             std::thread::sleep(Duration::from_millis(10));
         }
-        let mut add = Command::new("/usr/bin/ssh-add")
-            .arg("-q")
-            .arg("-")
-            .env("SSH_AUTH_SOCK", &real_sock)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .context("spawn ssh-add")?;
-        add.stdin.take().unwrap().write_all(&private_key)?;
-        drop(private_key);
-        let out = add.wait_with_output()?;
-        if !out.status.success() {
-            bail!("ssh-add failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+        for key in std::iter::once(private_key).chain(jump_key) {
+            let mut add = Command::new("/usr/bin/ssh-add")
+                .arg("-q")
+                .arg("-")
+                .env("SSH_AUTH_SOCK", &real_sock)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn()
+                .context("spawn ssh-add")?;
+            add.stdin.take().unwrap().write_all(&key)?;
+            drop(key);
+            let out = add.wait_with_output()?;
+            if !out.status.success() {
+                bail!("ssh-add failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+            }
         }
         let proxy_path = session_dir.join("agent.sock");
         let _ = std::fs::remove_file(&proxy_path);
@@ -292,7 +344,7 @@ impl SessionAgent {
                 Ok(l) => l,
                 Err(_) => return,
             };
-            let st = Arc::new(tokio::sync::Mutex::new(State { started: Instant::now(), bound_session: None }));
+            let st = Arc::new(tokio::sync::Mutex::new(State { started: Instant::now(), bound: [None, None] }));
             let deadline = tokio::time::sleep(policy.window);
             tokio::pin!(deadline);
             loop {
@@ -344,14 +396,24 @@ impl Drop for SessionAgent {
 
 async fn proxy_conn(d: Arc<Daemon>, p: Arc<Policy>, st: Arc<tokio::sync::Mutex<State>>, sa: Arc<SessionAgent>, mut c: UnixStream, real: &Path) -> Result<()> {
     let mut upstream: Option<UnixStream> = None;
+    // The hop this connection is bound to (session-bind); its key is the only one it sees.
+    let mut conn: Option<usize> = None;
     while let Some(m) = read_msg(&mut c).await? {
         let ty = m[0];
         let body = &m[1..];
         let verdict = match ty {
             SSH_AGENTC_REQUEST_IDENTITIES => {
-                let mut b = 1u32.to_be_bytes().to_vec();
-                put_string(&mut b, &p.key_blob);
-                put_string(&mut b, format!("swrap:{}:{}", p.label, p.ruser).as_bytes());
+                // Bound: that hop's key. Unbound (no session-bind): the target's key first.
+                let hops: Vec<usize> = match conn {
+                    Some(i) => vec![i],
+                    None => (0..p.hops()).collect(),
+                };
+                let mut b = (hops.len() as u32).to_be_bytes().to_vec();
+                for i in hops {
+                    let (label, ruser, key, _) = p.hop(i).expect("hop");
+                    put_string(&mut b, key);
+                    put_string(&mut b, format!("swrap:{label}:{ruser}").as_bytes());
+                }
                 c.write_all(&msg(SSH_AGENT_IDENTITIES_ANSWER, &b)).await?;
                 continue;
             }
@@ -359,7 +421,7 @@ async fn proxy_conn(d: Arc<Daemon>, p: Arc<Policy>, st: Arc<tokio::sync::Mutex<S
                 let mut r = Rd { b: body };
                 match r.string() {
                     Some(b"session-bind@openssh.com") => {
-                        let v = check_bind(&p, body, &mut *st.lock().await);
+                        let v = check_bind(&p, body, &mut *st.lock().await, &mut conn);
                         if matches!(v, Verdict::Allow) {
                             sa.hostbound.store(true, Ordering::SeqCst);
                         }
@@ -371,7 +433,7 @@ async fn proxy_conn(d: Arc<Daemon>, p: Arc<Policy>, st: Arc<tokio::sync::Mutex<S
             }
             SSH_AGENTC_SIGN_REQUEST => {
                 let n = sa.signatures.load(Ordering::SeqCst);
-                let v = check_sign(&p, body, &*st.lock().await, n);
+                let v = check_sign(&p, body, &*st.lock().await, n, conn);
                 if matches!(v, Verdict::Allow) {
                     sa.signatures.fetch_add(1, Ordering::SeqCst);
                 }
@@ -386,7 +448,8 @@ async fn proxy_conn(d: Arc<Daemon>, p: Arc<Policy>, st: Arc<tokio::sync::Mutex<S
                     SSH_AGENTC_EXTENSION => "agent.extension",
                     _ => "agent.request",
                 };
-                d.audit_event(&p.aaa_user, what, &p.label, &p.ruser, "refused", json!({"why": why}), &p.session_id);
+                let (label, ruser, _, _) = p.hop(conn.unwrap_or(0)).expect("hop");
+                d.audit_event(&p.aaa_user, what, label, ruser, "refused", json!({"why": why}), &p.session_id);
                 c.write_all(&msg(SSH_AGENT_FAILURE, &[])).await?;
             }
             Verdict::Allow => {
@@ -399,12 +462,15 @@ async fn proxy_conn(d: Arc<Daemon>, p: Arc<Policy>, st: Arc<tokio::sync::Mutex<S
                 let resp = read_msg(up).await?.context("agent closed")?;
                 c.write_all(&(resp.len() as u32).to_be_bytes()).await?;
                 c.write_all(&resp).await?;
+                let i = if ty == SSH_AGENTC_SIGN_REQUEST { sign_hop(&p, body, conn) } else { conn.unwrap_or(0) };
+                let (label, ruser, _, pinned) = p.hop(i).expect("hop");
+                let jump = if i == 1 { json!(true) } else { json!(null) };
                 if ty == SSH_AGENTC_SIGN_REQUEST {
-                    let bound = st.lock().await.bound_session.is_some();
-                    d.audit_event(&p.aaa_user, "agent.sign", &p.label, &p.ruser, if resp.first() == Some(&14) { "ok" } else { "agent-failed" },
-                        json!({"hostbound": bound, "n": sa.signatures.load(Ordering::SeqCst), "hostkeys": p.pinned.iter().map(|b| blob_fp(b)).collect::<Vec<_>>()}), &p.session_id);
+                    let bound = st.lock().await.bound[i].is_some();
+                    d.audit_event(&p.aaa_user, "agent.sign", label, ruser, if resp.first() == Some(&14) { "ok" } else { "agent-failed" },
+                        json!({"hostbound": bound, "n": sa.signatures.load(Ordering::SeqCst), "hostkeys": pinned.iter().map(|b| blob_fp(b)).collect::<Vec<_>>(), "jump": jump, "for": p.label}), &p.session_id);
                 } else {
-                    d.audit_event(&p.aaa_user, "agent.session-bind", &p.label, &p.ruser, "ok", json!({}), &p.session_id);
+                    d.audit_event(&p.aaa_user, "agent.session-bind", label, ruser, "ok", json!({"jump": jump, "for": p.label}), &p.session_id);
                 }
             }
         }
@@ -427,6 +493,7 @@ mod tests {
             max_sigs: 2,
             window: Duration::from_secs(60),
             require_hostbound: false,
+            jump: None,
         }
     }
 
@@ -453,21 +520,21 @@ mod tests {
     #[test]
     fn sign_filtering() {
         let p = policy();
-        let st = State { started: Instant::now(), bound_session: None };
-        assert!(matches!(check_sign(&p, &userauth("root", "publickey", b"KEY", None), &st, 0), Verdict::Allow));
-        assert!(matches!(check_sign(&p, &userauth("admin", "publickey", b"KEY", None), &st, 0), Verdict::Deny(_)));
-        assert!(matches!(check_sign(&p, &userauth("root", "publickey", b"OTHER", None), &st, 0), Verdict::Deny(_)));
-        assert!(matches!(check_sign(&p, &userauth("root", "publickey", b"KEY", None), &st, 2), Verdict::Deny(_)));
-        assert!(matches!(check_sign(&p, &userauth("root", "publickey-hostbound-v00@openssh.com", b"KEY", Some(b"HOSTKEY")), &st, 0), Verdict::Allow));
-        assert!(matches!(check_sign(&p, &userauth("root", "publickey-hostbound-v00@openssh.com", b"KEY", Some(b"EVIL")), &st, 0), Verdict::Deny(_)));
-        let old = State { started: Instant::now() - Duration::from_secs(120), bound_session: None };
-        assert!(matches!(check_sign(&p, &userauth("root", "publickey", b"KEY", None), &old, 0), Verdict::Deny(_)));
+        let st = State { started: Instant::now(), bound: [None, None] };
+        assert!(matches!(check_sign(&p, &userauth("root", "publickey", b"KEY", None), &st, 0, None), Verdict::Allow));
+        assert!(matches!(check_sign(&p, &userauth("admin", "publickey", b"KEY", None), &st, 0, None), Verdict::Deny(_)));
+        assert!(matches!(check_sign(&p, &userauth("root", "publickey", b"OTHER", None), &st, 0, None), Verdict::Deny(_)));
+        assert!(matches!(check_sign(&p, &userauth("root", "publickey", b"KEY", None), &st, 2, None), Verdict::Deny(_)));
+        assert!(matches!(check_sign(&p, &userauth("root", "publickey-hostbound-v00@openssh.com", b"KEY", Some(b"HOSTKEY")), &st, 0, None), Verdict::Allow));
+        assert!(matches!(check_sign(&p, &userauth("root", "publickey-hostbound-v00@openssh.com", b"KEY", Some(b"EVIL")), &st, 0, None), Verdict::Deny(_)));
+        let old = State { started: Instant::now() - Duration::from_secs(120), bound: [None, None] };
+        assert!(matches!(check_sign(&p, &userauth("root", "publickey", b"KEY", None), &old, 0, None), Verdict::Deny(_)));
         // Arbitrary data (not a userauth request) is refused.
         let mut b = vec![];
         put_string(&mut b, b"KEY");
         put_string(&mut b, b"git commit to sign");
         b.extend_from_slice(&0u32.to_be_bytes());
-        assert!(matches!(check_sign(&p, &b, &st, 0), Verdict::Deny(_)));
+        assert!(matches!(check_sign(&p, &b, &st, 0, None), Verdict::Deny(_)));
     }
 
     #[test]
@@ -482,10 +549,11 @@ mod tests {
             b.push(fwd);
             b
         };
-        let mut st = State { started: Instant::now(), bound_session: None };
-        assert!(matches!(check_bind(&p, &mk(b"EVIL", 0), &mut st), Verdict::Deny(_)));
-        assert!(matches!(check_bind(&p, &mk(b"HOSTKEY", 1), &mut st), Verdict::Deny(_)));
-        assert!(matches!(check_bind(&p, &mk(b"HOSTKEY", 0), &mut st), Verdict::Allow));
+        let mut st = State { started: Instant::now(), bound: [None, None] };
+        let mut conn = None;
+        assert!(matches!(check_bind(&p, &mk(b"EVIL", 0), &mut st, &mut conn), Verdict::Deny(_)));
+        assert!(matches!(check_bind(&p, &mk(b"HOSTKEY", 1), &mut st, &mut conn), Verdict::Deny(_)));
+        assert!(matches!(check_bind(&p, &mk(b"HOSTKEY", 0), &mut st, &mut conn), Verdict::Allow));
         // Now a sign request with a different session id is refused.
         let mut d = vec![];
         put_string(&mut d, b"OTHERSESSION");
@@ -500,7 +568,7 @@ mod tests {
         put_string(&mut b, b"KEY");
         put_string(&mut b, &d);
         b.extend_from_slice(&0u32.to_be_bytes());
-        assert!(matches!(check_sign(&p, &b, &st, 0), Verdict::Deny(_)));
+        assert!(matches!(check_sign(&p, &b, &st, 0, None), Verdict::Deny(_)));
     }
 
 }

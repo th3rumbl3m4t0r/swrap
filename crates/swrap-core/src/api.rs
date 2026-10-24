@@ -73,6 +73,8 @@ pub enum Req {
     },
     /// Fleet dnf upgrade (spec 10.10): `swupdate <targets> [--app <pkg>]`.
     Update { targets: String, #[serde(default)] app: Option<String> },
+    /// Reload systemd services so they run the code installed now (spec 10.11): `swreload <targets> <service>…`.
+    Reload { targets: String, services: Vec<String> },
     /// Audit event from swrap-shell / workers.
     Audit { action: String, #[serde(default)] target: String, #[serde(default)] result: String, #[serde(default)] detail: serde_json::Value },
     /// Is session `id` live and owned by the caller? (nested `sw` pause check)
@@ -238,6 +240,15 @@ pub struct AiSpec {
     pub context: u64,
     pub max_output: u64,
     pub timeout_secs: u64,
+    /// The backend's JSON status (paused while `state` is `on_battery`), and whether to wait out
+    /// a 503/429 with Retry-After instead of failing (see AiBackend).
+    #[serde(default)]
+    pub status_url: String,
+    #[serde(default)]
+    pub wait_unavailable: bool,
+    /// Tool calls parsed by swrap from raw output (see AiBackend::raw_tools).
+    #[serde(default)]
+    pub raw_tools: bool,
     /// `/run/swrap/ai/<id>`: proxy + MCP sockets (swrap:swai 0750).
     pub run_dir: String,
     /// Persistent opencode home for (user, target) (swai 0700).
@@ -289,6 +300,10 @@ pub struct AiSpec {
     pub claude: String,
     #[serde(default)]
     pub workdir: String,
+    /// A nightly ticket session (unattended): the table entry it works on, 0 otherwise. It ends
+    /// itself after `ticket_result`, and is reminded once to finish if the model stops without it.
+    #[serde(default)]
+    pub ticket: i64,
 }
 
 // ---------------------------------------------------------------- core ↔ edge (over the link)
@@ -340,6 +355,10 @@ pub struct EdgeSession {
     pub pub_key: String,
     pub label: String,
     pub ssh_bin: String,
+    /// More files for the session directory (a jump's key and config: `via`), name → content;
+    /// `@SWRAP_SDIR@` in `argv_tail` stands for that directory on the node running ssh.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_files: Vec<(String, String)>,
 }
 
 /// First frame on `core-pty.sock`: a delegated session for a user logged in on edge.

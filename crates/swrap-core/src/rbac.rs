@@ -266,6 +266,8 @@ mod tests {
             ai_allowed: false,
             ai_reset: false,
             proxmox: None,
+            via: String::new(),
+            via_from: vec![],
         }
     }
 

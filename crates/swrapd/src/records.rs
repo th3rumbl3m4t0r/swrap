@@ -25,8 +25,10 @@ pub fn ls(d: &Daemon, c: &Caller) -> Result<Resp> {
             continue;
         }
         let shown: Vec<String> = accts.iter().enumerate().map(|(i, a)| if i == 0 { format!("*{a}") } else { a.clone() }).collect();
-        text += &format!("{}\t{}\t{}:{}\t{}\n", h.label, match h.route { swrap_core::config::Route::Core => "core", _ => "edge" }, h.address, h.port, shown.join(","));
-        rows.push(json!({"label": h.label, "route": h.route, "address": h.address, "port": h.port, "accounts": accts, "tags": h.tags}));
+        let route = match h.route { swrap_core::config::Route::Core => "core", _ => "edge" };
+        let route = if h.via.is_empty() { route.to_string() } else { format!("{route} via {}", h.via) };
+        text += &format!("{}\t{}\t{}:{}\t{}\n", h.label, route, h.address, h.port, shown.join(","));
+        rows.push(json!({"label": h.label, "route": h.route, "via": h.via, "address": h.address, "port": h.port, "accounts": accts, "tags": h.tags}));
     }
     Ok(Resp { ok: true, data: json!(rows), text, ..Default::default() })
 }

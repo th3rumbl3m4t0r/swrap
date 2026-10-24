@@ -145,6 +145,112 @@ impl RemoteOut {
 /// Run a command on a host as `ruser` using the vault key at `enc` through a filtering agent.
 /// The output is also recorded into `rec` (a run swrec) when given.
 #[allow(clippy::too_many_arguments)]
+// ---------------------------------------------------------------- jumps (`via`)
+
+/// Stands for the session directory in plans another node runs (`EdgeSession.argv_tail`).
+pub const SDIR: &str = "@SWRAP_SDIR@";
+
+/// The jump leg of a host reached `via` another enrolled host: ssh to the target runs with a
+/// ProxyCommand `ssh -W %h:%p` to the via host, signed through the same per-session agent.
+pub struct Jump {
+    pub host: Host,
+    pub ruser: String,
+    pub enc: PathBuf,
+    pub pub_line: String,
+    pub profile: Profile,
+    pub known: String,
+}
+
+impl Jump {
+    pub fn of(d: &Daemon, h: &Host) -> Result<Option<Jump>> {
+        if h.via.is_empty() {
+            return Ok(None);
+        }
+        let v = Host::load(&d.paths, &h.via).map_err(|_| anyhow::anyhow!("{} goes via {}, which is not a host here", h.label, h.via))?;
+        if v.state != HostState::Active {
+            bail!("{} goes via {}, which is not enrolled", h.label, v.label);
+        }
+        if !v.via.is_empty() {
+            bail!("{} goes via {}, which itself goes via {}: one jump only", h.label, v.label, v.via);
+        }
+        let (ruser, enc) = std::iter::once("root".to_string())
+            .chain(std::iter::once(v.default_user.clone()))
+            .chain(v.accounts.iter().map(|a| a.name.clone()))
+            .find_map(|u| crate::session::credential(d, &v.label, &u).map(|c| (u, c.0)))
+            .ok_or_else(|| anyhow::anyhow!("no key for the jump host {}", v.label))?;
+        let pub_line = std::fs::read_to_string(PathBuf::from(enc.to_string_lossy().replace(".enc", ".pub")))?.trim().to_string();
+        let profile = Profile::load(&d.paths, &v.profile)?;
+        let known = std::fs::read_to_string(d.paths.known_hosts(&v.label)).with_context(|| format!("host keys of {} not pinned", v.label))?;
+        Ok(Some(Jump { host: v, ruser, enc, pub_line, profile, known }))
+    }
+
+    /// What the agent may sign on this leg.
+    pub fn hop(&self) -> agent::Hop {
+        agent::Hop { label: self.host.label.clone(), ruser: self.ruser.clone(), key_blob: agent::pub_blob(&self.pub_line).unwrap_or_default(), pinned: agent::pinned_blobs(&self.known) }
+    }
+
+    pub fn private(&self, d: &Daemon) -> Result<zeroize::Zeroizing<Vec<u8>>> {
+        d.with_dek(|dek| Vault::new(&d.paths, d.owner()).get(dek, &self.enc))
+    }
+
+    /// Files the ProxyCommand reads from the session directory.
+    pub fn files(&self) -> Vec<(String, String)> {
+        vec![("ssh_config_via".into(), self.profile.ssh_config()), ("via.pub".into(), format!("{}\n", self.pub_line))]
+    }
+
+    /// `-o ProxyCommand=…` for ssh running on `node` (core/edge) with session directory `sdir`
+    /// (a path, or `SDIR` in plans for edge). `tunnel`: reach the via host through edge first.
+    /// The session's known_hosts holds both hosts' pinned keys (by label: HostKeyAlias).
+    pub fn proxy_args(&self, node: &str, sdir: &str, tunnel: Option<&str>) -> Vec<String> {
+        let f = |n: &str| format!("'{sdir}/{n}'");
+        let mut c = format!(
+            "{ssh} -F {cfg} -E {log} -o LogLevel=DEBUG1 -o IdentityAgent={agent} -o IdentitiesOnly=yes -i {pubf} \
+             -o UserKnownHostsFile={known} -o GlobalKnownHostsFile=/dev/null -o StrictHostKeyChecking=yes -o UpdateHostKeys=no \
+             -o HostKeyAlias={label} -o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCountMax=4 \
+             -o ForwardAgent=no -o ForwardX11=no -o ClearAllForwardings=yes -o ControlMaster=no -o ControlPath=none \
+             -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no -o PermitLocalCommand=no",
+            ssh = self.profile.ssh_bin_for(node),
+            cfg = f("ssh_config_via"),
+            log = f("ssh_via.log"),
+            agent = f("agent.sock"),
+            pubf = f("via.pub"),
+            known = f("known_hosts"),
+            label = self.host.label,
+        );
+        match tunnel {
+            Some(t) => c += &format!(" -o 'ProxyCommand=/usr/libexec/swrap/swrapd tunnel {t}'"),
+            None => c += " -o ProxyCommand=none",
+        }
+        // The jump host's login banner and messages go to its log, not the session's stderr.
+        c += &format!(" -p {} -W %h:%p {}@{} 2>>{}", self.host.port, self.ruser, self.host.address, f("ssh_via.err"));
+        vec!["-o".into(), format!("ProxyCommand={c}")]
+    }
+}
+
+/// ssh-keyscan of `addr:port` run on the jump host (the target admits only it).
+pub fn keyscan_via(d: &Arc<Daemon>, who: &str, j: &Jump, addr: &str, port: u16) -> Result<Vec<(String, String)>> {
+    if addr.starts_with('-') || addr.contains(char::is_whitespace) || addr.contains('\'') {
+        bail!("bad address");
+    }
+    let r = remote(d, who, &j.host, &j.ruser, &j.enc, &j.profile, &j.known, &format!("ssh-keyscan -T 10 -p {port} -t ed25519,ecdsa,rsa '{addr}' 2>/dev/null"), b"", None)?;
+    Ok(parse_keyscan(&r.stdout))
+}
+
+fn parse_keyscan(text: &str) -> Vec<(String, String)> {
+    let mut v = vec![];
+    for l in text.lines() {
+        if l.starts_with('#') || l.trim().is_empty() {
+            continue;
+        }
+        let mut it = l.split_whitespace();
+        let (_h, Some(t), Some(b)) = (it.next(), it.next(), it.next()) else { continue };
+        if t.starts_with("ssh-") || t.starts_with("ecdsa-") {
+            v.push((t.to_string(), b.to_string()));
+        }
+    }
+    v
+}
+
 pub fn remote(d: &Arc<Daemon>, who: &str, host: &Host, ruser: &str, enc: &Path, profile: &Profile, known_hosts: &str, remote_cmd: &str, stdin: &[u8], rec: Option<&mut swrec::Writer>) -> Result<RemoteOut> {
     remote_ex(d, who, host, ruser, enc, profile, known_hosts, remote_cmd, stdin, rec, RemoteOpts::default())
 }
@@ -170,12 +276,22 @@ pub fn remote_stream(d: &Arc<Daemon>, who: &str, host: &Host, ruser: &str, enc: 
     let pubp = PathBuf::from(enc.to_string_lossy().replace(".enc", ".pub"));
     let pub_line = std::fs::read_to_string(&pubp)?;
     let w = |p: &str, data: &str| swrap_core::atomic::write(&sdir.join(p), data.as_bytes(), 0o600, d.owner());
+    // A host reached `via` another: the jump leg's files, and both hosts' pinned keys.
+    let jump = Jump::of(d, host)?;
+    let known_all = match &jump {
+        Some(j) => format!("{known_hosts}{}", j.known),
+        None => known_hosts.to_string(),
+    };
     w("ssh_config", &profile.ssh_config())?;
-    w("known_hosts", known_hosts)?;
+    w("known_hosts", &known_all)?;
     w("id.pub", &pub_line)?;
+    for (n, c) in jump.as_ref().map(|j| j.files()).unwrap_or_default() {
+        w(&n, &c)?;
+    }
     let private = d.with_dek(|dek| Vault::new(&d.paths, d.owner()).get(dek, enc))?;
+    let jump_key = jump.as_ref().map(|j| j.private(d)).transpose()?;
     let cfg = d.cfg();
-    let sa = SessionAgent::start(
+    let sa = SessionAgent::start_with_jump(
         d.clone(),
         Policy {
             session_id: id.clone(),
@@ -187,24 +303,29 @@ pub fn remote_stream(d: &Arc<Daemon>, who: &str, host: &Host, ruser: &str, enc: 
             max_sigs: cfg.signing.max_signatures_per_session,
             window: cfg.signing.window.exact().unwrap_or(Duration::from_secs(120)),
             require_hostbound: cfg.signing.require_hostbound,
+            jump: jump.as_ref().map(|j| j.hop()),
         },
         private,
+        jump_key,
         &sdir,
     )?;
     if host.network == Route::Edge {
         // Only edge can reach this host: edge runs ssh, signing through this very agent.
         use base64::Engine;
+        let mut argv_tail: Vec<String> = vec!["-o".into(), format!("HostKeyAlias={}", host.label), "-o".into(), "ConnectTimeout=15".into()];
+        if let Some(j) = &jump {
+            argv_tail.extend(j.proxy_args("edge", SDIR, None));
+        }
+        argv_tail.extend(["-T".into(), "-p".into(), host.port.to_string(), format!("{ruser}@{}", host.address), "--".into(), remote_cmd.to_string()]);
         let plan = swrap_core::api::EdgeSession {
             id: id.clone(),
             ssh_config: profile.ssh_config(),
-            known_hosts: known_hosts.to_string(),
+            known_hosts: known_all.clone(),
             pub_key: pub_line.clone(),
             label: host.label.clone(),
             ssh_bin: profile.ssh_bin_for("edge").to_string(),
-            argv_tail: vec![
-                "-o".into(), format!("HostKeyAlias={}", host.label), "-o".into(), "ConnectTimeout=15".into(),
-                "-T".into(), "-p".into(), host.port.to_string(), format!("{ruser}@{}", host.address), "--".into(), remote_cmd.to_string(),
-            ],
+            argv_tail,
+            extra_files: jump.as_ref().map(|j| j.files()).unwrap_or_default(),
             ..Default::default()
         };
         let secs = opts.timeout.map(|t| t.as_secs().max(1)).unwrap_or(600);
@@ -254,6 +375,7 @@ pub fn remote_stream(d: &Arc<Daemon>, who: &str, host: &Host, ruser: &str, enc: 
         .args(["-o", "StrictHostKeyChecking=yes", "-o", "UpdateHostKeys=no", "-o", "ForwardAgent=no", "-o", "ForwardX11=no",
             "-o", "ClearAllForwardings=yes", "-o", "ControlMaster=no", "-o", "ControlPath=none", "-o", "PasswordAuthentication=no",
             "-o", "KbdInteractiveAuthentication=no", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", "-T"])
+        .args(jump.as_ref().map(|j| j.proxy_args("core", &sdir.to_string_lossy(), None)).unwrap_or_default())
         .arg("-p").arg(host.port.to_string())
         .arg(format!("{ruser}@{}", host.address))
         .arg("--")
@@ -406,6 +528,10 @@ pub fn from_addrs(d: &Daemon, host: &Host) -> Vec<String> {
     let route = host.route;
     use std::net::ToSocketAddrs;
     let cfg = d.cfg();
+    if !host.via.is_empty() {
+        // Connections come from the via host (its egress as this host sees it: `--from`).
+        return if cfg.network.from_restriction { host.via_from.clone() } else { vec![] };
+    }
     let mut v: Vec<String> = vec![];
     if let Ok(o) = Command::new("ip").args(["-o", "addr", "show", "scope", "global"]).output() {
         for l in String::from_utf8_lossy(&o.stdout).lines() {
@@ -488,6 +614,13 @@ struct Swadd {
     /// the node you are logged into.
     #[arg(long)]
     network: Option<String>,
+    /// Reach the host through this enrolled host's sshd (a jump; for hosts that admit only it).
+    #[arg(long)]
+    via: Option<String>,
+    /// With --via: the address(es) the host sees connections from (the via host's egress),
+    /// for from= on swrap's keys; comma separated.
+    #[arg(long, value_delimiter = ',')]
+    from: Vec<String>,
     /// Poll every PT10S and run swenroll when the key is installed (needs --fingerprint or --yes).
     #[arg(long)]
     wait: bool,
@@ -503,7 +636,8 @@ fn enroll_snippet(d: &Daemon, h: &Host) -> Result<String> {
     let expiry = cfg.general.enroll_key_ttl.after(now()).strftime("%Y%m%d").to_string();
     let from = from_addrs(d, h);
     let opts = if !from.is_empty() { format!("from=\"{}\",expiry-time=\"{expiry}\",restrict", from.join(",")) } else { format!("expiry-time=\"{expiry}\",restrict") };
-    let mut t = format!("host {} (route {}, state pending). Paste on the target as root:\n\n", h.label, if h.route == Route::Core { "core" } else { "edge" });
+    let via = if h.via.is_empty() { String::new() } else { format!(", via {}", h.via) };
+    let mut t = format!("host {} (route {}{via}, state pending). Paste on the target as root:\n\n", h.label, if h.route == Route::Core { "core" } else { "edge" });
     t += "install -d -m 700 /root/.ssh && sed -i '/ swrap-enroll-/d' /root/.ssh/authorized_keys 2>/dev/null; cat >> /root/.ssh/authorized_keys <<'EOF'\n";
     for k in &keys {
         t += &format!("{opts} {k}\n");
@@ -526,8 +660,27 @@ fn swadd(d: &Arc<Daemon>, c: &Caller, a: Swadd, con: &Console) -> Result<Resp> {
     let cfg = d.cfg();
     let profile = a.profile.clone().unwrap_or(cfg.general.default_profile.clone());
     Profile::load(&d.paths, &profile)?;
+    // A jump: the host lives where its via host is reached from (network and route follow it).
+    let via = match &a.via {
+        Some(v) => {
+            let vh = Host::load(&d.paths, v).map_err(|_| anyhow::anyhow!("--via {v}: no such host"))?;
+            if vh.state != HostState::Active || !vh.via.is_empty() {
+                bail!("--via {v}: the host must be enrolled and reached directly (one jump only)");
+            }
+            for f in &a.from {
+                f.parse::<std::net::IpAddr>().map_err(|_| anyhow::anyhow!("--from {f}: not an IP address"))?;
+            }
+            if a.from.is_empty() && cfg.network.from_restriction {
+                bail!("--via needs --from <address the host sees {v} connect from> (for from= on swrap's keys)");
+            }
+            Some(vh)
+        }
+        None if !a.from.is_empty() => bail!("--from goes with --via"),
+        None => None,
+    };
     let internal = swrap_core::net::address_is_internal(&a.host, &cfg.network.internal_networks);
     let network = match a.network.as_deref() {
+        _ if via.is_some() => via.as_ref().map(|v| v.network).unwrap_or(Route::Core),
         Some("core") => Route::Core,
         Some("edge") => Route::Edge,
         Some(o) => bail!("--network takes core or edge, not {o}"),
@@ -536,6 +689,7 @@ fn swadd(d: &Arc<Daemon>, c: &Caller, a: Swadd, con: &Console) -> Result<Resp> {
         None => Route::Core,
     };
     let route = match a.route.as_deref() {
+        _ if via.is_some() => via.as_ref().map(|v| v.route).unwrap_or(Route::Core),
         Some("core") => Route::Core,
         Some("edge") => Route::Edge,
         Some(o) => bail!("--route takes core or edge, not {o}"),
@@ -579,11 +733,13 @@ fn swadd(d: &Arc<Daemon>, c: &Caller, a: Swadd, con: &Console) -> Result<Resp> {
             ai_allowed: false,
             ai_reset: false,
             proxmox: None,
+            via: via.as_ref().map(|v| v.label.clone()).unwrap_or_default(),
+            via_from: a.from.clone(),
         };
         d.write_config(&format!("hosts/{}.toml", a.label), &h.to_toml())?;
         d.commit(&format!("swadd {} {} by {}", a.label, a.host, c.name))?;
     }
-    d.audit_event(&c.name, "host.add", &a.label, "", "ok", json!({"address": a.host, "route": route}), "");
+    d.audit_event(&c.name, "host.add", &a.label, "", "ok", json!({"address": a.host, "route": route, "via": a.via, "from": a.from}), "");
     let h = Host::load(&d.paths, &a.label)?;
     let t = enroll_snippet(d, &h)?;
     let _ = keys;
@@ -593,7 +749,7 @@ fn swadd(d: &Arc<Daemon>, c: &Caller, a: Swadd, con: &Console) -> Result<Resp> {
         let ttl = cfg.general.enroll_key_ttl.exact().unwrap_or(Duration::from_secs(14 * 86400));
         let t0 = std::time::Instant::now();
         loop {
-            let hs = keyscan(&a.host, a.port, network).unwrap_or_default();
+            let hs = scan_host(d, &c.name, &h).unwrap_or_default();
             if !hs.is_empty() {
                 let r = swenroll(d, c, Swenroll { label: a.label.clone(), fingerprint: a.fingerprint.clone(), yes: a.yes, allow_legacy: false, probe_only: true }, &Console::null());
                 if r.map(|r| r.ok).unwrap_or(false) {
@@ -626,6 +782,14 @@ struct Swenroll {
     probe_only: bool,
 }
 
+/// The host keys a host offers, scanned from where swrap reaches it.
+fn scan_host(d: &Arc<Daemon>, who: &str, h: &Host) -> Result<Vec<(String, String)>> {
+    match Jump::of(d, h)? {
+        Some(j) => keyscan_via(d, who, &j, &h.address, h.port),
+        None => keyscan(&h.address, h.port, h.network),
+    }
+}
+
 fn keyscan(addr: &str, port: u16, network: Route) -> Result<Vec<(String, String)>> {
     let text = if network == Route::Edge {
         let v = crate::edge_jobs::submit(swrap_core::api::EdgeJob::Keyscan { id: swrap_core::new_id(), addr: addr.into(), port }, Duration::from_secs(45))?;
@@ -634,16 +798,7 @@ fn keyscan(addr: &str, port: u16, network: Route) -> Result<Vec<(String, String)
         let o = Command::new("ssh-keyscan").args(["-T", "10", "-p", &port.to_string(), "-t", "ed25519,ecdsa,rsa", addr]).output()?;
         String::from_utf8_lossy(&o.stdout).into_owned()
     };
-    let mut v = vec![];
-    for l in text.lines() {
-        if l.starts_with('#') || l.trim().is_empty() {
-            continue;
-        }
-        let mut it = l.split_whitespace();
-        let (_h, Some(t), Some(b)) = (it.next(), it.next(), it.next()) else { continue };
-        v.push((t.to_string(), b.to_string()));
-    }
-    Ok(v)
+    Ok(parse_keyscan(&text))
 }
 
 const PROBE: &str = r#"set +e
@@ -701,8 +856,8 @@ fn swenroll(d: &Arc<Daemon>, c: &Caller, a: Swenroll, con: &Console) -> Result<R
     if d.is_sealed() {
         bail!("swrap: vault sealed since {} — an admin must log in with password", d.disp(*d.sealed_since.lock().unwrap()));
     }
-    // 1. Pin host keys.
-    let scanned = keyscan(&host.address, host.port, host.network)?;
+    // 1. Pin host keys (scanned from the jump host for a host reached `via` it).
+    let scanned = scan_host(d, &c.name, &host)?;
     if scanned.is_empty() {
         bail!("no host keys from {}:{} (unreachable?)", host.address, host.port);
     }

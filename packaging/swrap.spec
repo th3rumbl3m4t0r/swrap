@@ -6,7 +6,7 @@
 %global debug_package %{nil}
 
 Name:           swrap
-Version:        0.2.0
+Version:        0.3.0
 Release:        1%{?dist}
 Summary:        Audited SSH jump host: recorded sessions, vault-held keys, fleet jobs, AI workbench
 License:        GPL-3.0-or-later
@@ -95,6 +95,12 @@ fi
 %{_datadir}/swrap
 
 %changelog
+* Sat Oct 24 2026 th3rumbl3m4t0r <th3rumbl3m4t0r@users.noreply.github.com> - 0.3.0-1
+- swai ticket worker (table tickets assigned to the AI), --raw-tools for llama.cpp, backends
+  that pause (status URL, wait out 503/429); hosts reached through another (--via);
+  swreload and automatic fixes on internet hosts; inventory of listening services;
+  doctor acknowledgements; edge clock alert only for a lasting offset
+
 * Sun Oct 04 2026 th3rumbl3m4t0r <th3rumbl3m4t0r@users.noreply.github.com> - 0.2.0-1
 - swai (AI workbench) handoffs, limits, Proxmox reset, chat view; swuser / swrotate; SELinux
   rules for core; edge state mirror, SFTP and fleet output through edge; x11 look; UTC default

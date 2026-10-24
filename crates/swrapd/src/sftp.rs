@@ -179,13 +179,22 @@ pub fn backend(d: &Arc<Daemon>, c: &Caller, session: &str, token: &str, entry: &
     let key_blob = agent::pub_blob(&pub_line).context("bad public key file")?;
     let bid = swrap_core::new_id();
     let sdir = crate::session::new_session_dir(d, &bid)?;
+    let jump = crate::hosts::Jump::of(d, &host)?;
+    let known_all = match &jump {
+        Some(j) => format!("{known}{}", j.known),
+        None => known.clone(),
+    };
     crate::session::write_owned(d, &sdir.join("ssh_config"), profile.ssh_config().as_bytes(), 0o600)?;
-    crate::session::write_owned(d, &sdir.join("known_hosts"), known.as_bytes(), 0o600)?;
+    crate::session::write_owned(d, &sdir.join("known_hosts"), known_all.as_bytes(), 0o600)?;
     crate::session::write_owned(d, &sdir.join("id.pub"), pub_line.as_bytes(), 0o600)?;
+    for (n, c) in jump.as_ref().map(|j| j.files()).unwrap_or_default() {
+        crate::session::write_owned(d, &sdir.join(n), c.as_bytes(), 0o600)?;
+    }
     let private = d.with_dek(|dek| swrap_vault::Vault::new(&d.paths, d.owner()).get(dek, &enc))?;
+    let jump_key = jump.as_ref().map(|j| j.private(d)).transpose()?;
     let cfg = d.cfg();
     let window = cfg.signing.window.exact().unwrap_or(Duration::from_secs(120));
-    let sa = SessionAgent::start(
+    let sa = SessionAgent::start_with_jump(
         d.clone(),
         Policy {
             session_id: bid.clone(),
@@ -197,15 +206,25 @@ pub fn backend(d: &Arc<Daemon>, c: &Caller, session: &str, token: &str, entry: &
             max_sigs: cfg.signing.max_signatures_per_session,
             window,
             require_hostbound: cfg.signing.require_hostbound,
+            jump: jump.as_ref().map(|j| j.hop()),
         },
         private,
+        jump_key,
         &sdir,
     )?;
     let worker = reg["worker_pid"].as_u64().filter(|p| *p > 0).map(|p| p as u32);
     crate::session::supervise_agent(d.clone(), sa, sdir.clone(), window, worker);
     let mut argv = crate::session::ssh_argv(profile.ssh_bin_for("core"), &sdir, label);
     argv.extend(["-o".into(), "ServerAliveInterval=30".into(), "-o".into(), "ServerAliveCountMax=4".into(), "-p".into(), host.port.to_string()]);
-    if host.network == Route::Edge {
+    if let Some(j) = &jump {
+        // Through the via host's sshd (ssh -W); that leg itself through edge if only edge reaches it.
+        let tid = (j.host.network == Route::Edge).then(|| {
+            let tid = swrap_core::new_id();
+            crate::edge_jobs::add_tunnel(&tid, &j.host.address, j.host.port);
+            tid
+        });
+        argv.extend(j.proxy_args("core", &sdir.to_string_lossy(), tid.as_deref()));
+    } else if host.network == Route::Edge {
         // Only edge reaches this host: ssh still runs here (this agent, hostbound checks, the
         // pinned keys), its TCP stream goes through edge, which sees only ciphertext.
         let tid = swrap_core::new_id();

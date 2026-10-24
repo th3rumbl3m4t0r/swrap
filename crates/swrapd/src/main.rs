@@ -22,11 +22,14 @@ mod daemon;
 mod hosts;
 mod inventory;
 mod motd;
+mod rawtools;
 mod records;
+mod reload;
 mod retention;
 mod session;
 mod sftp;
 mod table;
+mod tickets;
 mod unseal;
 mod util;
 mod worker;
@@ -130,6 +133,7 @@ fn run() -> Result<()> {
         tokio::spawn(doctor::run_loop(d.clone()));
         tokio::spawn(inventory::run_loop(d.clone()));
         tokio::spawn(table::run_loop(d.clone()));
+        tokio::spawn(tickets::run_loop(d.clone()));
         let d_e = d.clone();
         tokio::spawn(async move {
             if let Err(e) = edge_api::serve(d_e).await {

@@ -325,6 +325,7 @@ pub fn dispatch(d: &Arc<Daemon>, c: &Caller, req: Req, con: &Console) -> Result<
         Req::Fetch { id } => crate::records::fetch(d, c, &id, con),
         Req::Search { query } => crate::records::search(d, c, &query, con),
         Req::Update { targets, app } => crate::fleet::update(d, c, &targets, app.as_deref(), con),
+        Req::Reload { targets, services } => crate::reload::reload(d, c, &targets, &services, con),
         Req::Inventory { targets } => crate::inventory::inventory(d, c, &targets, con),
         Req::Run { targets, ruser, script_name, script_b64, args, secrets } => crate::fleet::run(d, c, &targets, ruser.as_deref(), &script_name, &script_b64, &args, &secrets, con),
         Req::SftpBackend { session, token, entry } => crate::sftp::backend(d, c, &session, &token, &entry),

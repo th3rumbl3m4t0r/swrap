@@ -26,7 +26,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use swrap_core::api::{AiSpec, Req, Resp, WorkerSpec};
@@ -68,16 +68,66 @@ struct Shared {
     recent: Mutex<VecDeque<String>>,
     /// Set by a successful handoff: the successor, and when; the session ends shortly after.
     handoff_to: Mutex<Option<(String, Instant)>>,
+    /// When the harness first fetched swrap's tool list (MCP `tools/list`).
+    tools_listed: Mutex<Option<Instant>>,
+    /// A Claude Code successor's briefing, pasted into its terminal once swrap's tools are
+    /// connected: as a startup argument it went out before the MCP server was, without tools.
+    /// (A ticket session's first prompt and its reminders go the same way.)
+    briefing: Mutex<Option<String>>,
+    /// Model requests and tool calls in flight, and when the last one ended.
+    busy: AtomicUsize,
+    idle_since: Mutex<Instant>,
+    /// A ticket session: when `ticket_result` went through (it ends shortly after), and the
+    /// reminders it got for stopping without one.
+    ticket_done: Mutex<Option<Instant>>,
+    nudges: AtomicUsize,
 }
+
+/// Holds a session busy (a model request, a tool call) while it lives.
+struct Busy<'a>(&'a Shared);
+
+impl<'a> Busy<'a> {
+    fn new(sh: &'a Shared) -> Self {
+        sh.busy.fetch_add(1, Ordering::SeqCst);
+        Busy(sh)
+    }
+}
+
+impl Drop for Busy<'_> {
+    fn drop(&mut self) {
+        *self.0.idle_since.lock().unwrap() = Instant::now();
+        self.0.busy.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// The tools a person approves in an interactive session (they change hosts); everything else
+/// runs without asking. A ticket session (approval "allow") asks for none.
+fn asks(tool: &str) -> bool {
+    matches!(tool, "exec" | "write_file" | "edit_file" | "update" | "reboot")
+}
+
+/// A ticket session that stopped without `ticket_result` is reminded after this long idle, at
+/// most `MAX_NUDGES` times (then swrapd ends it after its idle limit).
+const NUDGE_AFTER: Duration = Duration::from_secs(120);
+const MAX_NUDGES: usize = 2;
+/// After `ticket_result`: a moment for the model's last words, then the session ends.
+const TICKET_END: Duration = Duration::from_secs(8);
+const NUDGE_TEXT: &str = "[swrap, nightly ticket worker] Nobody is watching this run and nobody can answer. Finish the ticket now: do what is left that is yours to do, then call ticket_result (resolved, report, assign or retry) with your worknotes.";
 
 impl Shared {
     fn record(&self, k: &str, v: Value) {
         if let Value::Object(m) = v {
-            let _ = self.w.lock().unwrap().record(k, m);
+            let line = Value::Object(m.clone()).to_string();
+            if let Err(e) = self.w.lock().unwrap().record(k, m) {
+                eprintln!("swai worker: {k} record not recorded ({e:#}): {}", line.chars().take(2000).collect::<String>());
+            }
         }
     }
     fn note(&self, msg: &str) {
-        let _ = self.w.lock().unwrap().note(msg);
+        // After the end (a request still in flight when the session ended) it goes to the journal.
+        if let Err(e) = self.w.lock().unwrap().note(msg) {
+            eprintln!("swai worker: {msg} (not recorded: {e:#})");
+        }
     }
 }
 
@@ -162,6 +212,12 @@ pub fn run(spec: WorkerSpec, client: UnixStream) -> Result<()> {
         agent,
         recent: Mutex::new(VecDeque::new()),
         handoff_to: Mutex::new(None),
+        tools_listed: Mutex::new(None),
+        briefing: Mutex::new((ai.api == "claude-code" && !ai.first_prompt.is_empty()).then(|| ai.first_prompt.clone())),
+        busy: AtomicUsize::new(0),
+        idle_since: Mutex::new(Instant::now()),
+        ticket_done: Mutex::new(None),
+        nudges: AtomicUsize::new(0),
     });
     for (l, which) in [(infer_l, 0), (mcp_l, 1), (tunnel_l, 2)] {
         let sh = sh.clone();
@@ -287,16 +343,14 @@ fn spawn_sandbox(spec: &WorkerSpec, ai: &AiSpec, slave: &OwnedFd) -> Result<Pid>
         ]);
         let tools: Vec<String> = ai.tools.as_array().into_iter().flatten().filter_map(|t| t["name"].as_str().map(String::from)).collect();
         let allow_all = ai.approval == "allow";
-        let allowed: Vec<String> = tools.iter().filter(|t| allow_all || !matches!(t.as_str(), "exec" | "write_file" | "edit_file")).map(|t| format!("mcp__swrap__{t}")).collect();
+        let allowed: Vec<String> = tools.iter().filter(|t| allow_all || !asks(t)).map(|t| format!("mcp__swrap__{t}")).collect();
         let mcp = json!({"mcpServers": {"swrap": {"type": "stdio", "command": "/opt/swai/swrap", "args": ["swai-mcp"]}}}).to_string();
         let what = if ai.mode == "aaa" { "aaa".to_string() } else { format!("{}@{}", ai.ruser, ai.label) };
         let what = if ai.loose { format!("{what} · loose") } else { what };
         tail.push("/opt/swai/claude/claude".into());
-        if !ai.first_prompt.is_empty() {
-            // A handoff successor starts on its predecessor's briefing. Positional, ahead of
-            // the options (some take several values and would swallow it).
-            tail.push(ai.first_prompt.clone());
-        }
+        // A handoff successor's briefing is not an argument: Claude Code would send it before
+        // its MCP connection to swrap is up, i.e. without tools. The relay pastes it once the
+        // harness has listed swrap's tools (see `paste_briefing`).
         tail.extend([
             // No built-in tools (no shell, files or web): only swrap's.
             "--tools".into(), "".into(),
@@ -407,7 +461,7 @@ fn opencode_config(spec: &WorkerSpec, ai: &AiSpec) -> Value {
     let approval = if ai.approval.is_empty() { "ask" } else { ai.approval.as_str() };
     let mut perm = Map::new();
     for t in ai.tools.as_array().into_iter().flatten().filter_map(|t| t["name"].as_str()) {
-        let v = if matches!(t, "exec" | "write_file" | "edit_file") { approval } else { "allow" };
+        let v = if asks(t) { approval } else { "allow" };
         perm.insert(format!("swrap_{t}"), json!(v));
     }
     let mut tools = Map::new();
@@ -616,6 +670,97 @@ fn greet(sh: &Shared, client: &mut UnixStream, attached: bool) -> bool {
 /// Like tmux: the session lives on when the client goes away (detached) and takes a new client
 /// through swrapd (`swai attach`). It ends when opencode exits, on `swai kill`, on SIGTERM, or
 /// after `detached_timeout` without a client.
+/// Progress of a successor's briefing paste: started (the relay), pasted (then Enter follows).
+struct Paste {
+    started: Instant,
+    sent: Option<Instant>,
+    /// Pastes so far (the first is the briefing or first prompt; later ones are reminders).
+    count: usize,
+}
+
+/// Wait after the tool list before pasting (the TUI settles), and at most this long for it.
+const PASTE_SETTLE: Duration = Duration::from_millis(1500);
+const PASTE_WAIT_TOOLS: Duration = Duration::from_secs(90);
+
+#[derive(Debug, PartialEq)]
+enum PasteStep {
+    Wait,
+    /// Paste now; `true` when swrap's tools were never listed (given up waiting).
+    Paste(bool),
+    Enter,
+}
+
+/// What to do for a pending briefing: `listed` = time since the harness listed swrap's tools,
+/// `waited` = time since the session started, `sent` = time since the paste went in.
+fn paste_step(pending: bool, listed: Option<Duration>, waited: Duration, sent: Option<Duration>) -> PasteStep {
+    if let Some(s) = sent {
+        return if s >= Duration::from_millis(600) { PasteStep::Enter } else { PasteStep::Wait };
+    }
+    match (pending, listed) {
+        (false, _) => PasteStep::Wait,
+        (true, Some(l)) if l >= PASTE_SETTLE => PasteStep::Paste(false),
+        (true, None) if waited >= PASTE_WAIT_TOOLS => PasteStep::Paste(true),
+        _ => PasteStep::Wait,
+    }
+}
+
+/// The bytes that paste `text`: bracketed when the TUI asked for it (newlines stay text),
+/// otherwise one line (a newline would submit early).
+fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
+    if bracketed {
+        [b"\x1b[200~".as_slice(), text.as_bytes(), b"\x1b[201~"].concat()
+    } else {
+        text.replace("\r\n", "\n").replace('\n', " ").into_bytes()
+    }
+}
+
+/// Pastes a Claude Code successor's briefing once the harness has listed swrap's tools, then
+/// submits it with Enter.
+fn paste_briefing(sh: &Shared, master: &mut File, modes: &Modes, p: &mut Paste) {
+    let pending = sh.briefing.lock().unwrap().is_some();
+    let listed = sh.tools_listed.lock().unwrap().map(|t| t.elapsed());
+    match paste_step(pending, listed, p.started.elapsed(), p.sent.map(|t| t.elapsed())) {
+        PasteStep::Wait => {}
+        PasteStep::Enter => {
+            p.sent = None;
+            let _ = master.write_all(b"\r");
+            let _ = sh.w.lock().unwrap().input(b"\r");
+        }
+        PasteStep::Paste(gave_up) => {
+            let text = sh.briefing.lock().unwrap().take().unwrap_or_default();
+            let bytes = paste_bytes(&text, modes.dec.get(&2004).copied().unwrap_or(false));
+            let _ = master.write_all(&bytes);
+            let _ = sh.w.lock().unwrap().input(&bytes);
+            p.sent = Some(Instant::now());
+            *sh.idle_since.lock().unwrap() = Instant::now();
+            p.count += 1;
+            if p.count > 1 {
+                // A reminder: `nudge` noted it.
+            } else if gave_up {
+                sh.note(&format!("handoff briefing pasted, but the harness had not listed swrap's tools after {}: the model may have no tools", fmt_duration_ms(PASTE_WAIT_TOOLS)));
+                worker::audit("ai.handoff_no_tools", &sh.ai.label, "tools not listed", json!({"id": sh.spec.id}));
+            } else {
+                sh.note(if sh.ai.ticket != 0 && sh.spec.header.get("continues").is_none() { "ticket prompt pasted after the harness listed swrap's tools" } else { "handoff briefing pasted after the harness listed swrap's tools" });
+            }
+        }
+    }
+}
+
+/// Remind a ticket session that went idle without `ticket_result` (pasted like a briefing).
+fn nudge(sh: &Shared) {
+    let idle = sh.busy.load(Ordering::SeqCst) == 0 && sh.idle_since.lock().unwrap().elapsed() >= NUDGE_AFTER;
+    let ready = sh.tools_listed.lock().unwrap().is_some() && sh.briefing.lock().unwrap().is_none();
+    let over = sh.ticket_done.lock().unwrap().is_some() || sh.handoff_to.lock().unwrap().is_some();
+    let n = sh.nudges.load(Ordering::SeqCst);
+    if !idle || !ready || over || n >= MAX_NUDGES {
+        return;
+    }
+    sh.nudges.store(n + 1, Ordering::SeqCst);
+    *sh.idle_since.lock().unwrap() = Instant::now();
+    *sh.briefing.lock().unwrap() = Some(NUDGE_TEXT.to_string());
+    sh.note(&format!("ticket session idle for {} without ticket_result: reminder {} of {MAX_NUDGES}", fmt_duration_ms(NUDGE_AFTER), n + 1));
+}
+
 fn relay(sh: &Arc<Shared>, client: UnixStream, master: OwnedFd, pid: Pid, ctl: UnixListener) -> Result<(String, i32)> {
     let spec = &sh.spec;
     let mut client = Some(client);
@@ -633,6 +778,7 @@ fn relay(sh: &Arc<Shared>, client: UnixStream, master: OwnedFd, pid: Pid, ctl: U
     let mut vt = vt100::Parser::new(size.1, size.0, 0);
     let mut detached_at: Option<Instant> = None;
     let detached_max = Duration::from_secs(sh.ai.detached_secs.max(60));
+    let mut paste = Paste { started: Instant::now(), sent: None, count: 0 };
     let mut next_tick = Duration::from_millis(5);
     let detach = |client: &mut Option<UnixStream>, why: &str, detached_at: &mut Option<Instant>, fb: &mut FrameBuf| {
         if client.take().is_some() {
@@ -660,6 +806,16 @@ fn relay(sh: &Arc<Shared>, client: UnixStream, master: OwnedFd, pid: Pid, ctl: U
                 break;
             }
         }
+        // A nightly ticket session ends shortly after its ticket_result, and is reminded when
+        // the model stops without one.
+        if sh.ai.ticket != 0 {
+            if sh.ticket_done.lock().unwrap().is_some_and(|t| t.elapsed() > TICKET_END) {
+                reason = "ticket done".into();
+                break;
+            }
+            nudge(sh);
+        }
+        paste_briefing(sh, &mut master_f, &modes, &mut paste);
         let timeout = PollTimeout::try_from(next_tick.min(Duration::from_millis(200)).as_millis() as i32).unwrap_or(PollTimeout::NONE);
         let (mr, cr, lr) = {
             let mut fds = vec![PollFd::new(master_f.as_fd(), PollFlags::POLLIN), PollFd::new(ctl.as_fd(), PollFlags::POLLIN)];
@@ -995,6 +1151,7 @@ fn serve_infer(sh: Arc<Shared>, mut c: UnixStream) {
             return;
         }
     };
+    let _busy = Busy::new(&sh);
     if sh.ai.harness == "claude" {
         if let Err(e) = passthrough(&sh, &mut c, &req) {
             sh.note(&format!("inference proxy: {e:#}"));
@@ -1407,6 +1564,8 @@ impl RawUp {
 enum Up {
     Tls { status: u16, headers: Vec<(String, String)>, reader: Box<dyn Read + Send> },
     Raw(RawUp),
+    /// `/completion` raw output translated into a chat completion (`raw_tools`).
+    Synth { inner: Box<Up>, s: crate::rawtools::Synth, headers: Vec<(String, String)>, done: bool },
 }
 
 impl Up {
@@ -1414,12 +1573,14 @@ impl Up {
         match self {
             Up::Tls { status, .. } => *status,
             Up::Raw(r) => r.status,
+            Up::Synth { .. } => 200,
         }
     }
     fn headers(&self) -> &[(String, String)] {
         match self {
             Up::Tls { headers, .. } => headers,
             Up::Raw(r) => &r.headers,
+            Up::Synth { headers, .. } => headers,
         }
     }
     fn header(&self, k: &str) -> Option<&str> {
@@ -1437,6 +1598,24 @@ impl Up {
                 Ok(Some(buf))
             }
             Up::Raw(r) => r.next(client),
+            Up::Synth { inner, s, done, .. } => loop {
+                if *done {
+                    return Ok(None);
+                }
+                match inner.next(client)? {
+                    Some(b) => {
+                        let out = s.push(&b);
+                        if !out.is_empty() {
+                            return Ok(Some(out));
+                        }
+                    }
+                    None => {
+                        *done = true;
+                        let out = s.end();
+                        return Ok((!out.is_empty()).then_some(out));
+                    }
+                }
+            },
         }
     }
     fn read_all(&mut self, limit: usize, client: &UnixStream) -> String {
@@ -1478,6 +1657,45 @@ fn take_slot(dir: &Path, backend: &str, max: u32, wait: Duration) -> Result<Opti
         }
         std::thread::sleep(Duration::from_millis(200));
     }
+}
+
+/// Whether a backend's status URL says it is paused (UPS on battery); None when unreadable.
+fn backend_paused(url: &str) -> Option<bool> {
+    let mut r = crate::ai::http(Duration::from_secs(5)).get(url).call().ok()?;
+    if r.status() != 200 {
+        return None;
+    }
+    let v: Value = serde_json::from_str(&r.body_mut().read_to_string().ok()?).ok()?;
+    Some(crate::ai::status_paused(&v))
+}
+
+/// The upstream request: as sent, or with `raw_tools` through the template and raw completion
+/// (chat requests without images on llama.cpp; swrap parses the tool calls).
+fn send_up(sh: &Shared, api: Api, req: &HttpReq, path: &str, body: &[u8], key: Option<&str>, client: &UnixStream) -> Result<Up> {
+    if sh.ai.raw_tools && api == Api::Openai && path.ends_with("/chat/completions") {
+        if let Ok(v) = serde_json::from_slice::<Value>(body) {
+            if !crate::rawtools::has_images(&v) {
+                return upstream_raw(sh, req, &v, key, client);
+            }
+        }
+    }
+    upstream(sh, api, req, path, body, key, client)
+}
+
+fn upstream_raw(sh: &Shared, req: &HttpReq, v: &Value, key: Option<&str>, client: &UnixStream) -> Result<Up> {
+    let mut t = upstream(sh, Api::Openai, req, "/apply-template", &serde_json::to_vec(&crate::rawtools::template_request(v))?, key, client)?;
+    if t.status() != 200 {
+        return Ok(t); // e.g. 503 on battery: handled like any other answer
+    }
+    let text = t.read_all(256 << 20, client);
+    let prompt = serde_json::from_str::<Value>(&text).ok().and_then(|x| x["prompt"].as_str().map(String::from)).ok_or_else(|| anyhow!("{}: /apply-template gave no prompt", sh.ai.backend))?;
+    let inner = upstream(sh, Api::Openai, req, "/completion", &serde_json::to_vec(&crate::rawtools::completion_request(v, &prompt))?, key, client)?;
+    if inner.status() != 200 {
+        return Ok(inner);
+    }
+    let s = crate::rawtools::Synth::new(v, &prompt, &swrap_core::new_id());
+    let headers = vec![("content-type".to_string(), s.content_type().to_string())];
+    Ok(Up::Synth { inner: Box::new(inner), s, headers, done: false })
 }
 
 fn upstream(sh: &Shared, api: Api, req: &HttpReq, path: &str, body: &[u8], key: Option<&str>, client: &UnixStream) -> Result<Up> {
@@ -1664,7 +1882,9 @@ fn infer(sh: &Arc<Shared>, c: &mut UnixStream, req: &HttpReq, api: Api) -> Resul
     let abandoned = |sh: &Shared| {
         sh.record("a", json!({"n": n, "status": 0, "cancelled": true, "latency": fmt_duration_ms(t0.elapsed()), "error": "the client abandoned the request before the model answered"}));
     };
-    let mut resp = match upstream(sh, api, req, &path, &serde_json::to_vec(&body)?, key.as_deref().map(|k| k.as_str()), c) {
+    // What went upstream (sent again after a pause, see below).
+    let mut sent = serde_json::to_vec(&body)?;
+    let mut resp = match send_up(sh, api, req, &path, &sent, key.as_deref().map(|k| k.as_str()), c) {
         Ok(r) => r,
         Err(e) if e.is::<ClientGone>() => {
             abandoned(sh);
@@ -1680,7 +1900,8 @@ fn infer(sh: &Arc<Shared>, c: &mut UnixStream, req: &HttpReq, api: Api) -> Resul
             sh.effort_off.store(true, Ordering::SeqCst);
             sh.record("n", json!({"msg": format!("{} rejected effort {}; continuing without it", sh.ai.model, effort.as_deref().unwrap_or("")), "detail": text.chars().take(2000).collect::<String>()}));
             effort = None;
-            resp = match upstream(sh, api, req, &path, &serde_json::to_vec(&orig)?, key.as_deref().map(|k| k.as_str()), c) {
+            sent = serde_json::to_vec(&orig)?;
+            resp = match send_up(sh, api, req, &path, &sent, key.as_deref().map(|k| k.as_str()), c) {
                 Ok(r) => r,
                 Err(e) if e.is::<ClientGone>() => {
                     abandoned(sh);
@@ -1696,6 +1917,69 @@ fn infer(sh: &Arc<Shared>, c: &mut UnixStream, req: &HttpReq, api: Api) -> Resul
             let _ = c.write_all(text.as_bytes());
             return Ok(());
         }
+    }
+    // A backend that pauses (UPS on battery, queue full) answers 503/429 with Retry-After: wait
+    // for it and send the request again, within the backend timeout, instead of failing the turn.
+    let mut paused: Option<(Instant, String)> = None;
+    while sh.ai.wait_unavailable && matches!(resp.status(), 503 | 429) {
+        let status = resp.status();
+        let retry = resp.header("retry-after").and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(30).clamp(5, 600);
+        let text = resp.read_all(64 << 10, c);
+        let why = serde_json::from_str::<Value>(&text).ok().and_then(|v| v["error"]["message"].as_str().map(String::from)).unwrap_or_else(|| text.chars().take(200).collect());
+        let limit = Duration::from_secs(sh.ai.timeout_secs.max(60));
+        if t0.elapsed() + Duration::from_secs(10) >= limit {
+            // Out of time: the harness gets the backend's own answer.
+            sh.note(&format!("{}: still unavailable after {} ({why}); the request fails", sh.ai.backend, fmt_duration_ms(t0.elapsed())));
+            sh.record("a", json!({"n": n, "status": status, "error": text.chars().take(8000).collect::<String>(), "latency": fmt_duration_ms(t0.elapsed())}));
+            sh.stats.lock().unwrap().errors += 1;
+            let ct = resp.header("content-type").unwrap_or("application/json").to_string();
+            let _ = write_head(c, status, &ct, &[("content-length".into(), text.len().to_string()), ("retry-after".into(), retry.to_string())]);
+            let _ = c.write_all(text.as_bytes());
+            return Ok(());
+        }
+        if paused.is_none() {
+            sh.note(&format!(
+                "{} paused: {why} (HTTP {status}, retry after PT{retry}S); waiting, then sending the request again (within {})",
+                sh.ai.backend,
+                fmt_duration_ms(limit)
+            ));
+            paused = Some((Instant::now(), why.clone()));
+        }
+        drop(resp);
+        // With a status URL: until it no longer says paused (checked every 10 s); otherwise, or
+        // while it cannot be read, the Retry-After.
+        let until = Instant::now() + Duration::from_secs(retry);
+        loop {
+            std::thread::sleep(Duration::from_secs(10).min(Duration::from_secs(retry)));
+            if client_gone(c) {
+                abandoned(sh);
+                return Ok(());
+            }
+            if t0.elapsed() + Duration::from_secs(10) >= limit {
+                break;
+            }
+            if !sh.ai.status_url.is_empty() {
+                match backend_paused(&sh.ai.status_url) {
+                    Some(false) => break,
+                    Some(true) => continue,
+                    None => {}
+                }
+            }
+            if Instant::now() >= until {
+                break;
+            }
+        }
+        resp = match send_up(sh, api, req, &path, &sent, key.as_deref().map(|k| k.as_str()), c) {
+            Ok(r) => r,
+            Err(e) if e.is::<ClientGone>() => {
+                abandoned(sh);
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        };
+    }
+    if let Some((since, why)) = paused {
+        sh.note(&format!("{} available again after {} ({why}); request sent again", sh.ai.backend, fmt_duration_ms(since.elapsed())));
     }
     drop(key);
     let _ = effort;
@@ -2013,13 +2297,17 @@ fn serve_mcp(sh: Arc<Shared>, c: UnixStream) {
                 "serverInfo": {"name": "swrap", "version": env!("CARGO_PKG_VERSION")},
             }})),
             "ping" => reply(&writer, json!({"jsonrpc": "2.0", "id": id, "result": {}})),
-            "tools/list" => reply(&writer, json!({"jsonrpc": "2.0", "id": id, "result": {"tools": sh.ai.tools}})),
+            "tools/list" => {
+                reply(&writer, json!({"jsonrpc": "2.0", "id": id, "result": {"tools": sh.ai.tools}}));
+                sh.tools_listed.lock().unwrap().get_or_insert_with(Instant::now);
+            }
             "tools/call" => {
                 // Calls may overlap (parallel tool use); each gets its own thread.
                 let (sh, w) = (sh.clone(), writer.clone());
                 std::thread::spawn(move || {
                     let name = m["params"]["name"].as_str().unwrap_or("").to_string();
                     let args = m["params"]["arguments"].clone();
+                    let _busy = Busy::new(&sh);
                     let result = call_tool(&sh, &name, &args);
                     reply(&w, json!({"jsonrpc": "2.0", "id": id, "result": result}));
                 });
@@ -2104,7 +2392,8 @@ fn call_tool(sh: &Shared, name: &str, args: &Value) -> Value {
     }
     let n = sh.tool_no.fetch_add(1, Ordering::SeqCst) + 1;
     let call = format!("t{n}");
-    if n as usize > sh.ai.max_tool_calls {
+    // A ticket session can always end its ticket.
+    if n as usize > sh.ai.max_tool_calls && name != "ticket_result" {
         let msg = format!("tool budget of this session is exhausted ({} calls): call handoff with a complete briefing; a new session continues with a fresh budget", sh.ai.max_tool_calls);
         sh.record("t", json!({"call": call, "tool": name, "args": args_for_record(name, args), "error": true, "result": msg}));
         sh.note(&msg);
@@ -2129,6 +2418,10 @@ fn call_tool(sh: &Shared, name: &str, args: &Value) -> Value {
     }));
     record_output(sh, &call, 1, &out);
     record_output(sh, &call, 2, &err);
+    if name == "ticket_result" && !is_err && sh.ai.ticket != 0 {
+        *sh.ticket_done.lock().unwrap() = Some(Instant::now());
+        sh.note("ticket_result recorded: the session ends in a few seconds");
+    }
     {
         let mut st = sh.stats.lock().unwrap();
         st.tool_calls += 1;
@@ -2178,6 +2471,34 @@ fn digest_args(name: &str, args: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn briefing_waits_for_the_tool_list() {
+        let ms = Duration::from_millis;
+        // Started, tools not listed yet: wait (the bug: the briefing went out before the tools).
+        assert_eq!(paste_step(true, None, ms(5000), None), PasteStep::Wait);
+        // Listed, but the TUI gets a moment to settle.
+        assert_eq!(paste_step(true, Some(ms(200)), ms(5000), None), PasteStep::Wait);
+        assert_eq!(paste_step(true, Some(PASTE_SETTLE), ms(5000), None), PasteStep::Paste(false));
+        // Never listed: paste anyway after the limit, flagged.
+        assert_eq!(paste_step(true, None, PASTE_WAIT_TOOLS, None), PasteStep::Paste(true));
+        // Then Enter, once.
+        assert_eq!(paste_step(false, Some(ms(9000)), ms(9000), Some(ms(100))), PasteStep::Wait);
+        assert_eq!(paste_step(false, Some(ms(9000)), ms(9000), Some(ms(700))), PasteStep::Enter);
+        assert_eq!(paste_step(false, Some(ms(9000)), ms(9000), None), PasteStep::Wait);
+        assert_eq!(paste_bytes("a\nb", true), b"\x1b[200~a\nb\x1b[201~".to_vec());
+        assert_eq!(paste_bytes("a\r\nb\nc", false), b"a b c".to_vec());
+    }
+
+    #[test]
+    fn host_changing_tools_ask_in_interactive_sessions() {
+        for t in ["exec", "write_file", "edit_file", "update", "reboot"] {
+            assert!(asks(t), "{t} must ask");
+        }
+        for t in ["read_file", "inventory", "hosts", "search", "transcript", "handoff", "ticket", "ticket_result"] {
+            assert!(!asks(t), "{t} runs without asking");
+        }
+    }
 
     #[test]
     fn backend_slots_cap_requests_across_holders() {

@@ -822,6 +822,13 @@ async fn prepare_session(e: &Arc<Edge>, plan: &EdgeSession) -> Result<(PathBuf, 
     swrap_core::atomic::write(&sdir.join("ssh_config"), plan.ssh_config.as_bytes(), 0o600, own)?;
     swrap_core::atomic::write(&sdir.join("known_hosts"), plan.known_hosts.as_bytes(), 0o600, own)?;
     swrap_core::atomic::write(&sdir.join("id.pub"), plan.pub_key.as_bytes(), 0o600, own)?;
+    // A jump's files (via host key, its ssh config); plain names inside the session dir only.
+    for (name, content) in &plan.extra_files {
+        if !swrap_core::paths::safe_component(name) || name.starts_with('.') || ["ssh_config", "known_hosts", "id.pub", "agent.sock", "ssh.log"].contains(&name.as_str()) {
+            bail!("bad extra file name {name:?} from core");
+        }
+        swrap_core::atomic::write(&sdir.join(name), content.as_bytes(), 0o600, own)?;
+    }
     let asock = sdir.join("agent.sock");
     // The session directory is 0700: bind with the normal umask, then 0600 (a umask change
     // would apply to the whole process, every thread and every program started meanwhile).
@@ -875,7 +882,9 @@ async fn prepare_session(e: &Arc<Edge>, plan: &EdgeSession) -> Result<(PathBuf, 
         "-o".into(), "KbdInteractiveAuthentication=no".into(),
         "-o".into(), "BatchMode=yes".into(),
     ];
-    argv.extend(plan.argv_tail.iter().cloned());
+    // `@SWRAP_SDIR@` (a jump's ProxyCommand) is this session's directory here.
+    let sd = sdir.to_string_lossy().to_string();
+    argv.extend(plan.argv_tail.iter().map(|x| x.replace("@SWRAP_SDIR@", &sd)));
     Ok((sdir, argv, authed))
 }
 

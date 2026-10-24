@@ -786,6 +786,11 @@ fn wizard(mut c: Choice) -> Result<Option<Choice>> {
                             "anthropic" => "Claude API (key) · opencode".to_string(),
                             _ => format!("local · {} · opencode", b["base_url"].as_str().unwrap_or("")),
                         };
+                        // The server's own state (UPS battery, thermal throttling, queue) when it reports one.
+                        let desc = match b["status"].as_str() {
+                            Some(st) => format!("{desc} · {st}"),
+                            None => desc,
+                        };
                         let it = if b["ready"].as_bool() == Some(true) { Item::new(&name, desc, &name) } else { Item::new(&name, b["why"].as_str().unwrap_or(""), &name).off() };
                         items.push(it);
                     }

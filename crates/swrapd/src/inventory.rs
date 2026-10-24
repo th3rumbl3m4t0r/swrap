@@ -58,9 +58,10 @@ case $PM in
 esac
 sec updates
 case $PM in
-  dnf4) timeout 75 dnf -q repoquery --upgrades --latest-limit 1 --qf '%{name}.%{arch}\t%{evr}\t%{repoid}' 2>/dev/null ;;
-  dnf5) timeout 75 dnf -q repoquery --upgrades --latest-limit 1 --qf '%{name}.%{arch}\t%{evr}\t%{repoid}\n' 2>/dev/null ;;
-  apt) apt list --upgradable 2>/dev/null | awk -F'[/ ]' 'NF>=3 && $0 ~ /upgradable/ {print $1"\t"$3"\t"$2}' ;;
+  dnf4) timeout 75 dnf -q ${SWINV_REFRESH:+--refresh} repoquery --upgrades --latest-limit 1 --qf '%{name}.%{arch}\t%{evr}\t%{repoid}' 2>/dev/null ;;
+  dnf5) timeout 75 dnf -q ${SWINV_REFRESH:+--refresh} repoquery --upgrades --latest-limit 1 --qf '%{name}.%{arch}\t%{evr}\t%{repoid}\n' 2>/dev/null ;;
+  apt) [ -n "$SWINV_REFRESH" ] && $S timeout 60 apt-get -qq update >/dev/null 2>&1
+       apt list --upgradable 2>/dev/null | awk -F'[/ ]' 'NF>=3 && $0 ~ /upgradable/ {print $1"\t"$3"\t"$2}' ;;
 esac
 echo "@@SWINV-RC $?"
 sec security
@@ -79,6 +80,33 @@ elif [ "$PM" = dnf4 ] || [ "$PM" = dnf5 ]; then
     if [ -z "$k" ]; then echo unknown; elif [ "$k" = "$(uname -r)" ]; then echo no; else echo yes; fi;;
   esac
 else echo no; fi
+sec listen
+# Listening sockets (S: proto, address, port, program, pid), each process's binary (X; it ends
+# in " (deleted)" when replaced since the process started), the shared objects it mapped (M,
+# "deleted" likewise) and the packages owning those files (O).
+listen() {
+  socks=$(ss -Htulnp 2>/dev/null | awk '{
+    port = $5; sub(/.*:/, "", port); addr = substr($5, 1, length($5) - length(port) - 1); s = $0
+    while (match(s, /\("[^"]+",pid=[0-9]+/)) {
+      u = substr(s, RSTART + 2, RLENGTH - 2); s = substr(s, RSTART + RLENGTH); i = index(u, "\",pid=")
+      print "S\t" $1 "\t" addr "\t" port "\t" substr(u, 1, i - 1) "\t" substr(u, i + 6)
+    }
+  }')
+  [ -n "$socks" ] || return 0
+  printf '%s\n' "$socks"
+  procs=$(for pid in $(printf '%s\n' "$socks" | cut -f6 | sort -un); do
+    e=$(readlink "/proc/$pid/exe" 2>/dev/null) || continue
+    printf 'X\t%s\t%s\n' "$pid" "$e"
+    awk -v pid="$pid" '$6 ~ /^\// && $6 ~ /\.so/ && $6 !~ /^\/(dev|memfd:)/ {print "M\t" pid "\t" $6 "\t" ($7 == "(deleted)" ? "deleted" : "-")}' "/proc/$pid/maps" 2>/dev/null | sort -u
+  done)
+  printf '%s\n' "$procs"
+  files=$(printf '%s\n' "$procs" | awk -F'\t' '$1 == "X" {sub(/ \(deleted\)$/, "", $3); print $3} $1 == "M" && $4 != "deleted" {print $3}' | sort -u)
+  case $1 in
+    dnf*) for f in $files; do o=$(rpm -qf --qf '%{NAME}\n' "$f" 2>/dev/null | head -1); case $o in *' '*|'') ;; *) printf 'O\t%s\t%s\n' "$f" "$o" ;; esac; done ;;
+    apt) dpkg-query -S $files $(printf '%s\n' "$files" | sed -n 's|^/usr/|/|p') 2>/dev/null | awk -F': ' '!/^diversion/ && NF >= 2 {split($1, p, ", "); sub(/:.*/, "", p[1]); print "O\t" $2 "\t" p[1]}' ;;
+  esac
+}
+$S timeout 40 bash -c "$(declare -f listen); listen $PM"
 sec accounts
 getent passwd | awk -F: '($3==0 || $3>=1000) && $3!=65534 {print $1"\t"$3"\t"$7"\t"$6}' | while IFS="$(printf '\t')" read -r u uid sh home; do
   s=-; case " $(id -nG "$u" 2>/dev/null) " in *" wheel "*|*" sudo "*|*" admin "*) s=group;; esac
@@ -111,8 +139,9 @@ timeout 40 find /opt /srv /root /home /var/www /usr/local/src -xdev -maxdepth 4 
 done
 "#;
 
-fn collector() -> String {
-    format!("{COLLECTOR}\nsec gitrepos\n{GIT_SCAN}\nsec end\n")
+/// `refresh`: fetch fresh package metadata first (internet hosts, see `table::TableCfg`).
+fn collector(refresh: bool) -> String {
+    format!("{}{COLLECTOR}\nsec gitrepos\n{GIT_SCAN}\nsec end\n", if refresh { "SWINV_REFRESH=1\n" } else { "" })
 }
 
 static LOCK: Mutex<()> = Mutex::new(());
@@ -182,15 +211,173 @@ fn syncfs(p: &Path) -> Result<()> {
 /// Names of packages with a security advisory *and* an update available (`security` lines are
 /// advisory, severity, package; `updates` lines start with `name.arch` or, for apt, `name`).
 fn actionable_security(security: &[String], updates: &[String]) -> BTreeSet<String> {
-    let upgradable: BTreeSet<&str> = updates
-        .iter()
-        .filter_map(|l| l.split('\t').next())
-        .map(|n| match n.rsplit_once('.') {
-            Some((name, arch)) if ["x86_64", "noarch", "i686", "aarch64", "src"].contains(&arch) => name,
-            _ => n,
+    let upgradable: BTreeSet<&str> = updates.iter().filter_map(|l| l.split('\t').next()).map(update_name).collect();
+    security.iter().filter_map(|l| security_pkg(l)).filter(|n| upgradable.contains(n)).map(String::from).collect()
+}
+
+/// The package a `security` line names: a NEVRA for dnf (`openssl-1:3.0.7-27.el9.x86_64`), the
+/// name itself for apt (`-\t-\topenssh-sftp-server`).
+fn security_pkg(l: &str) -> Option<&str> {
+    let f: Vec<&str> = l.split('\t').collect();
+    let p = *f.get(2)?;
+    Some(if f[0] == "-" { p } else { nevra_name(p) })
+}
+
+/// The name in an `updates` line's first column: `name.arch` (dnf) or `name` (apt).
+fn update_name(n: &str) -> &str {
+    match n.rsplit_once('.') {
+        Some((name, arch)) if ["x86_64", "noarch", "i686", "aarch64", "src"].contains(&arch) => name,
+        _ => n,
+    }
+}
+
+/// name → installed version from `packages` lines (name, version, arch); a zero epoch is left
+/// out (`0:1.20.1-22.el9_6.3` → `1.20.1-22.el9_6.3`).
+fn versions(packages: &[String]) -> BTreeMap<String, String> {
+    let mut m = BTreeMap::new();
+    for l in packages {
+        let mut f = l.split('\t');
+        if let (Some(n), Some(v)) = (f.next(), f.next()) {
+            m.entry(n.to_string()).or_insert_with(|| v.strip_prefix("0:").unwrap_or(v).to_string());
+        }
+    }
+    m
+}
+
+/// Where a listening address answers from.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Reach {
+    Loopback,
+    Private,
+    /// A wildcard address: every interface.
+    Any,
+    Public,
+}
+
+fn reach(addr: &str) -> Reach {
+    let (a, ifc) = addr.split_once('%').unwrap_or((addr, ""));
+    let a = a.trim_start_matches('[').trim_end_matches(']');
+    match a.parse::<std::net::IpAddr>() {
+        _ if ifc == "lo" => Reach::Loopback,
+        _ if a == "*" => Reach::Any,
+        Ok(ip) if ip.is_loopback() => Reach::Loopback,
+        Ok(ip) if ip.is_unspecified() => Reach::Any,
+        Ok(std::net::IpAddr::V4(v)) if v.is_private() || v.is_link_local() || (v.octets()[0] == 100 && v.octets()[1] & 0xc0 == 64) => Reach::Private,
+        Ok(std::net::IpAddr::V6(v)) if v.segments()[0] & 0xfe00 == 0xfc00 || v.segments()[0] & 0xffc0 == 0xfe80 => Reach::Private,
+        Ok(_) => Reach::Public,
+        // Not understood: counted as reachable from anywhere.
+        Err(_) => Reach::Any,
+    }
+}
+
+/// A listening program of a host, a line of `services.tsv`.
+#[derive(Debug, PartialEq)]
+struct Service {
+    /// `tcp/443`
+    port: String,
+    addr: String,
+    reach: Reach,
+    program: String,
+    exe: String,
+    package: String,
+    version: String,
+    /// Its binary or a library it mapped was replaced since it started: it still runs old code.
+    restart: bool,
+    /// Packages of the libraries it mapped.
+    libs: BTreeSet<String>,
+}
+
+impl Service {
+    fn line(&self) -> String {
+        let reach = match self.reach {
+            Reach::Loopback => "loopback",
+            Reach::Private => "private",
+            Reach::Any => "any",
+            Reach::Public => "public",
+        };
+        let dash = |s: &str| if s.is_empty() { "-".to_string() } else { s.to_string() };
+        let libs = self.libs.iter().cloned().collect::<Vec<_>>().join(",");
+        format!("{}\t{}\t{reach}\t{}\t{}\t{}\t{}\t{}\t{}", self.port, self.addr, self.program, dash(&self.exe), dash(&self.package), dash(&self.version), if self.restart { "yes" } else { "no" }, dash(&libs))
+    }
+
+    fn parse(l: &str) -> Option<Service> {
+        let f: Vec<&str> = l.split('\t').collect();
+        let undash = |s: &str| if s == "-" { String::new() } else { s.to_string() };
+        let reach = match *f.get(2)? {
+            "private" => Reach::Private,
+            "public" => Reach::Public,
+            "loopback" => Reach::Loopback,
+            _ => Reach::Any,
+        };
+        Some(Service {
+            port: f[0].into(),
+            addr: f[1].into(),
+            reach,
+            program: f.get(3)?.to_string(),
+            exe: undash(f.get(4)?),
+            package: undash(f.get(5)?),
+            version: undash(f.get(6)?),
+            restart: *f.get(7)? == "yes",
+            libs: f.get(8).filter(|s| **s != "-").map(|s| s.split(',').map(String::from).collect()).unwrap_or_default(),
+        })
+    }
+
+    /// Reachable from the internet, on a host that is: on a wildcard or public address, or on
+    /// any address when the host has no public one (behind NAT, ports forwarded to it).
+    fn internet(&self, host_public: bool) -> bool {
+        matches!(self.reach, Reach::Any | Reach::Public) || (!host_public && self.reach == Reach::Private)
+    }
+}
+
+/// The listening programs in the collector's `listen` section, loopback left out: one per
+/// port, address and program, ordered by port (an unchanged host writes the same file).
+fn services(listen: &str, versions: &BTreeMap<String, String>) -> Vec<Service> {
+    let (mut socks, mut exe, mut maps, mut owner) = (BTreeMap::new(), BTreeMap::new(), BTreeMap::<&str, Vec<(&str, bool)>>::new(), BTreeMap::new());
+    for l in listen.lines() {
+        match l.split('\t').collect::<Vec<_>>().as_slice() {
+            ["S", proto, addr, port, prog, pid] if reach(addr) != Reach::Loopback => {
+                let pid: u64 = pid.parse().unwrap_or(u64::MAX);
+                let e = socks.entry((format!("{proto}/{port}"), addr.to_string(), prog.to_string())).or_insert(pid);
+                *e = (*e).min(pid);
+            }
+            ["X", pid, path] => {
+                exe.insert(pid.parse::<u64>().unwrap_or(0), *path);
+            }
+            ["M", pid, path, flag] => maps.entry(*pid).or_default().push((*path, *flag == "deleted")),
+            ["O", path, pkg] => {
+                // dpkg may know a file under /lib while it was mapped from /usr/lib
+                owner.insert(path.strip_prefix("/usr").unwrap_or(path).to_string(), *pkg);
+            }
+            _ => {}
+        }
+    }
+    let own = |p: &str| owner.get(p.strip_prefix("/usr").unwrap_or(p)).map(|s| s.to_string()).unwrap_or_default();
+    let mut v: Vec<Service> = socks
+        .into_iter()
+        .map(|((port, addr, program), pid)| {
+            let raw = exe.get(&pid).copied().unwrap_or("");
+            let path = raw.strip_suffix(" (deleted)").unwrap_or(raw);
+            let mapped = maps.get(pid.to_string().as_str()).map(Vec::as_slice).unwrap_or(&[]);
+            let package = own(path);
+            Service {
+                reach: reach(&addr),
+                version: versions.get(&package).cloned().unwrap_or_default(),
+                restart: raw.ends_with(" (deleted)") || mapped.iter().any(|(_, gone)| *gone),
+                libs: mapped.iter().filter(|(_, gone)| !gone).map(|(p, _)| own(p)).filter(|o| !o.is_empty() && *o != package).collect(),
+                exe: path.to_string(),
+                package,
+                port,
+                addr,
+                program,
+            }
         })
         .collect();
-    security.iter().filter_map(|l| l.split('\t').nth(2)).map(nevra_name).filter(|n| upgradable.contains(n)).map(String::from).collect()
+    let key = |s: &Service| {
+        let (proto, n) = s.port.split_once('/').unwrap_or(("", ""));
+        (proto.to_string(), n.parse::<u32>().unwrap_or(0), s.addr.clone(), s.program.clone())
+    };
+    v.sort_by_key(key);
+    v
 }
 
 /// `openssl-1:3.0.7-27.el9.x86_64` → `openssl`.
@@ -322,7 +509,8 @@ fn one(d: &Arc<Daemon>, who: &str, run: &Run, t: &Target, signer: &swrec::RecSig
     let known = std::fs::read_to_string(d.paths.known_hosts(&h.label)).context("host keys not pinned")?;
     let mut rec = run.host_writer(d, h, &t.ruser, who, "swinv")?;
     let t0 = Instant::now();
-    let cmd = format!("bash -c {}", crate::ai::q(&collector()));
+    let refresh = crate::table::cfg(d).internet_hosts.contains(&h.label);
+    let cmd = format!("bash -c {}", crate::ai::q(&collector(refresh)));
     let r = remote_stream(d, who, h, &t.ruser, &enc, &profile, &known, &cmd, b"", Some(&mut rec), RemoteOpts { timeout: Some(HOST_TIMEOUT), cap: 64 << 20 }, &mut |_, _| {});
     let dur = fmt_duration_ms(t0.elapsed());
     let when = fmt_utc(now());
@@ -359,6 +547,7 @@ fn one(d: &Arc<Daemon>, who: &str, run: &Run, t: &Target, signer: &swrec::RecSig
         // versions of install-only packages (kernels), which only need the reboot.
         let security_pkgs = actionable_security(&security, &updates).len();
         let reboot = secs.get("needs-reboot").map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).unwrap_or_else(|| "unknown".into());
+        let services: Vec<String> = services(secs.get("listen").map(String::as_str).unwrap_or(""), &versions(&packages)).iter().map(Service::line).collect();
         // Global addresses, filtered and ordered like the endpoint agent's (same strings, no churn).
         let (mut v4, mut v6) = (BTreeSet::new(), BTreeSet::new());
         for l in secs.get("ips").map(|s| s.lines().collect::<Vec<_>>()).unwrap_or_default() {
@@ -420,6 +609,7 @@ fn one(d: &Arc<Daemon>, who: &str, run: &Run, t: &Target, signer: &swrec::RecSig
         w("updates.tsv", lines(&updates))?;
         w("security-updates.tsv", lines(&security))?;
         w("needs-reboot", format!("{reboot}\n"))?;
+        w("services.tsv", lines(&services))?;
         w("accounts.tsv", lines(&accounts))?;
         if !sshd.trim().is_empty() {
             w("sshd-effective.txt", sshd)?;
@@ -476,6 +666,67 @@ fn sections(out: &str) -> BTreeMap<String, String> {
     m
 }
 
+/// A host's internet-exposed services from its last inventory: on a wildcard or public address,
+/// or on any address but loopback when the host has no public one (see `Service::internet`).
+fn exposed(dir: &Path, f: &serde_json::Map<String, Value>) -> Vec<Service> {
+    let s = |k: &str| f.get(k).and_then(|v| v.as_str()).unwrap_or_default().to_string();
+    let public = s("ipv4").split(", ").chain(s("ipv6").split(", ")).any(|a| !a.is_empty() && reach(a) == Reach::Public);
+    std::fs::read_to_string(dir.join("services.tsv")).unwrap_or_default().lines().filter_map(Service::parse).filter(|x| x.internet(public)).collect()
+}
+
+/// What swrap fixes by itself on an internet host (`table::TableCfg::internet_reload`).
+#[derive(Default, Debug, PartialEq)]
+pub struct Fix {
+    /// Packages with a security fix that those services run (their binary or a library).
+    pub packages: BTreeSet<String>,
+    /// Services to reload afterwards (`internet_reload` names, their program names).
+    pub services: BTreeSet<String>,
+    /// What was found (the fixed versions, the services running replaced code): swrap tries
+    /// the same at most once a day.
+    pub id: String,
+}
+
+/// The fix for internet host `label` from its last good inventory, if one is due: its
+/// internet-exposed `internet_reload` services with a security fix pending for what they run,
+/// or still running replaced code.
+pub fn internet_fix(d: &Daemon, label: &str) -> Option<Fix> {
+    let c = crate::table::cfg(d);
+    if c.internet_reload.is_empty() || !c.internet_hosts.iter().any(|h| h == label) {
+        return None;
+    }
+    let dir = host_dir(d, label);
+    let f = read_facts(&dir);
+    if !f.get("inventory_status").and_then(|v| v.as_str()).is_some_and(|s| s.starts_with("ok")) {
+        return None;
+    }
+    let lines = |n: &str| std::fs::read_to_string(dir.join(n)).unwrap_or_default().lines().map(String::from).collect::<Vec<_>>();
+    let updates = lines("updates.tsv");
+    let pending = actionable_security(&lines("security-updates.tsv"), &updates);
+    fix_of(&exposed(&dir, &f), &pending, &updates, &c.internet_reload)
+}
+
+fn fix_of(exposed: &[Service], pending: &BTreeSet<String>, updates: &[String], reload: &[String]) -> Option<Fix> {
+    let newer: BTreeMap<&str, &str> = updates.iter().filter_map(|l| l.split_once('\t')).map(|(n, rest)| (update_name(n), rest.split('\t').next().unwrap_or(""))).collect();
+    let mut fix = Fix::default();
+    let mut stale = BTreeSet::new();
+    for x in exposed.iter().filter(|x| reload.contains(&x.program)) {
+        let used: Vec<&String> = pending.iter().filter(|p| x.package == **p || x.libs.contains(*p)).collect();
+        if x.restart {
+            stale.insert(x.program.clone());
+        }
+        if x.restart || !used.is_empty() {
+            fix.services.insert(x.program.clone());
+        }
+        fix.packages.extend(used.into_iter().cloned());
+    }
+    if fix.services.is_empty() {
+        return None;
+    }
+    let fixed: Vec<String> = fix.packages.iter().map(|p| format!("{p} {}", newer.get(p.as_str()).copied().unwrap_or("?"))).collect();
+    fix.id = format!("{} | {}", fixed.join(", "), stale.into_iter().collect::<Vec<_>>().join(", "));
+    Some(fix)
+}
+
 fn read_facts(dir: &Path) -> serde_json::Map<String, Value> {
     std::fs::read_to_string(dir.join("facts.toml"))
         .ok()
@@ -494,7 +745,6 @@ pub fn conditions(d: &Daemon, label: &str) -> Vec<crate::table::Condition> {
         return vec![];
     }
     let s = |k: &str| f.get(k).map(|v| v.as_str().map(String::from).unwrap_or_else(|| v.to_string())).unwrap_or_default();
-    let n = |k: &str| f.get(k).and_then(Value::as_i64).unwrap_or(0);
     let mut v = vec![];
     let status = s("inventory_status");
     if !status.starts_with("ok") {
@@ -502,6 +752,7 @@ pub fn conditions(d: &Daemon, label: &str) -> Vec<crate::table::Condition> {
             kind: "unreachable",
             summary: "not reachable for inventory".into(),
             detail: format!("The inventory could not read {label} ({status}); last good inventory {}. Check the host, its network and its swrap enrollment (sw {label}).", s("last_inventory")),
+            ..Default::default()
         });
         return v; // the other facts are stale
     }
@@ -510,22 +761,67 @@ pub fn conditions(d: &Daemon, label: &str) -> Vec<crate::table::Condition> {
             kind: "reboot",
             summary: "reboot needed".into(),
             detail: format!("{label} needs a reboot: a newer kernel or core library is installed than is running (running kernel {}, up since {}).", s("kernel"), s("last_boot")),
+            ..Default::default()
         });
     }
-    if n("security_updates") > 0 {
-        let lines = |f: &str| std::fs::read_to_string(dir.join(f)).unwrap_or_default().lines().map(String::from).collect::<Vec<_>>();
-        let pkgs = actionable_security(&lines("security-updates.tsv"), &lines("updates.tsv"));
+    let lines = |f: &str| std::fs::read_to_string(dir.join(f)).unwrap_or_default().lines().map(String::from).collect::<Vec<_>>();
+    let (security, updates) = (lines("security-updates.tsv"), lines("updates.tsv"));
+    let mut pkgs = actionable_security(&security, &updates);
+    let advisories = |p: &str| security.iter().filter(|l| security_pkg(l) == Some(p)).filter_map(|l| l.split('\t').next()).filter(|a| *a != "-").map(String::from).collect::<BTreeSet<_>>();
+    // Internet hosts: fixes for what their internet-exposed services run (binary or library)
+    // and replaced code those still run are ticketed when found; the rest monthly (table).
+    if crate::table::cfg(d).internet_hosts.iter().any(|h| h == label) {
+        let exposed = exposed(&dir, &f);
+        let installed = versions(&lines("packages.tsv"));
+        let newer: BTreeMap<&str, &str> = updates.iter().filter_map(|l| l.split_once('\t')).map(|(n, rest)| (update_name(n), rest.split('\t').next().unwrap_or(""))).collect();
+        for p in pkgs.clone() {
+            let users: BTreeSet<String> = exposed.iter().filter(|x| x.package == p || x.libs.contains(&p)).map(|x| format!("{} {}", x.port, x.program)).collect();
+            if users.is_empty() {
+                continue;
+            }
+            pkgs.remove(&p);
+            let new = newer.get(p.as_str()).copied().unwrap_or("?");
+            let adv = advisories(&p);
+            v.push(Condition {
+                kind: "internet-security",
+                summary: "security fixes for internet-exposed services".into(),
+                id: format!("{p} {new}"),
+                detail: format!(
+                    "{label} is reachable from the internet, and its internet-exposed {} use {p} {}, which has a security fix in {new}{}.\nApply it now: swupdate {label}, then swreload {label} <service> for what still runs the old code (a restart where it has no reload).",
+                    users.into_iter().collect::<Vec<_>>().join(", "),
+                    installed.get(&p).map(String::as_str).unwrap_or("?"),
+                    if adv.is_empty() { String::new() } else { format!(" ({})", adv.into_iter().collect::<Vec<_>>().join(", ")) }
+                ),
+            });
+        }
+        for x in exposed.iter().filter(|x| x.restart) {
+            v.push(Condition {
+                kind: "internet-restart",
+                summary: "internet-exposed services run replaced code".into(),
+                id: format!("{}@{}", x.program, x.port),
+                detail: format!(
+                    "{label}: {} {} ({}) is reachable from the internet and still runs a binary or library that an update replaced after it started, so fixes in it are not in effect. Reload it (swreload {label} <service>), or restart it where a reload does not load new code.",
+                    x.port,
+                    x.program,
+                    if x.package.is_empty() { x.exe.clone() } else { format!("{} {}", x.package, x.version) }
+                ),
+            });
+        }
+    }
+    if !pkgs.is_empty() {
         let list: Vec<&String> = pkgs.iter().take(25).collect();
+        let adv: BTreeSet<String> = pkgs.iter().flat_map(|p| advisories(p)).collect();
         v.push(Condition {
             kind: "security",
-            summary: format!("{} packages with security fixes", n("security_updates")),
+            summary: format!("{} packages with security fixes", pkgs.len()),
             detail: format!(
                 "{label} has security fixes pending for {} packages ({} advisories), e.g. {}{}.\nApply them: swupdate {label}",
-                n("security_updates"),
-                n("security_advisories"),
+                pkgs.len(),
+                adv.len(),
                 list.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "),
                 if pkgs.len() > list.len() { ", …" } else { "" }
             ),
+            ..Default::default()
         });
     }
     if s("endpoint_agent") == "none" {
@@ -533,6 +829,7 @@ pub fn conditions(d: &Daemon, label: &str) -> Vec<crate::table::Condition> {
             kind: "agent",
             summary: "endpoint agent not deployed".into(),
             detail: format!("{label} has no endpoint agent, so its disks, SMART health and a full root filesystem are not monitored. swrap deploys it by itself when the table admin login is in the vault (`swrap table admin-password`); otherwise, or when that failed (the reason is below), run `swrap table agent {label}` as a swrap admin."),
+            ..Default::default()
         });
     }
     if let Some(drift) = f.get("sudoers_drift").and_then(Value::as_array).filter(|a| !a.is_empty()) {
@@ -540,6 +837,7 @@ pub fn conditions(d: &Daemon, label: &str) -> Vec<crate::table::Condition> {
             kind: "sudoers",
             summary: "swrap sudoers files differ from what swuser wrote".into(),
             detail: format!("{label}: {}. swrap-* files are written by swuser (swuser sudo <host> <account> on|off restores them); check who changed them.", drift.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", ")),
+            ..Default::default()
         });
     }
     v
@@ -642,24 +940,29 @@ fn rebuild_indexes(d: &Daemon) -> Result<()> {
     Ok(())
 }
 
-/// The PT6H run over every active host (spec 10.7). Waits for an unsealed vault.
+/// The PT6H run over every active host (spec 10.7), and in between the internet hosts every
+/// `internet_every` (table settings). Waits for an unsealed vault.
 pub async fn run_loop(d: Arc<Daemon>) {
     tokio::time::sleep(Duration::from_secs(300)).await;
-    let mut last: Option<Instant> = None;
+    let (mut last, mut last_net): (Option<Instant>, Option<Instant>) = (None, None);
     loop {
-        if !d.is_sealed() && last.map(|l| l.elapsed() >= EVERY).unwrap_or(true) {
+        let tc = crate::table::cfg(&d);
+        let net_every = swrap_core::time::IsoDuration::parse(&tc.internet_every).ok().and_then(|x| x.exact()).unwrap_or(Duration::from_secs(3600)).max(Duration::from_secs(600));
+        let all = last.map(|l| l.elapsed() >= EVERY).unwrap_or(true);
+        let net = !tc.internet_hosts.is_empty() && last_net.map(|l| l.elapsed() >= net_every).unwrap_or(true);
+        if !d.is_sealed() && (all || net) {
             let d2 = d.clone();
             let r = tokio::task::spawn_blocking(move || {
                 let list: Vec<Target> = Host::all(&d2.paths)
                     .unwrap_or_default()
                     .into_iter()
-                    .filter(|h| h.state == HostState::Active)
+                    .filter(|h| h.state == HostState::Active && (all || tc.internet_hosts.contains(&h.label)))
                     .filter_map(|h| system_account(&d2, &h).map(|ruser| Target { host: h, ruser }))
                     .collect();
                 if list.is_empty() {
                     return Ok(Resp::ok(json!({})));
                 }
-                collect(&d2, "swrap", "@all", list, None)
+                collect(&d2, "swrap", if all { "@all" } else { "@internet" }, list, None)
             })
             .await;
             match r {
@@ -667,7 +970,10 @@ pub async fn run_loop(d: Arc<Daemon>) {
                 Ok(Err(e)) => eprintln!("swrapd: inventory: {e:#}"),
                 Err(e) => eprintln!("swrapd: inventory: {e}"),
             }
-            last = Some(Instant::now());
+            if all {
+                last = Some(Instant::now());
+            }
+            last_net = Some(Instant::now());
         }
         tokio::time::sleep(Duration::from_secs(600)).await;
     }
@@ -703,6 +1009,90 @@ mod tests {
         let upd = vec!["openssl.x86_64\t1:3.5.1-2.el10\tbaseos".to_string()];
         assert_eq!(actionable_security(&sec, &upd).into_iter().collect::<Vec<_>>(), vec!["openssl".to_string()]);
         assert!(actionable_security(&sec, &[]).is_empty());
+    }
+
+    #[test]
+    fn apt_security_names_stay_whole() {
+        let sec = vec!["-\t-\topenssh-sftp-server".to_string(), "-\t-\tlibssl3t64".to_string()];
+        let upd = vec!["openssh-sftp-server\t1:10.0p1-7+deb13u1\ttrixie-security".to_string(), "libssl3t64\t3.5.1-1+deb13u2\ttrixie-security".to_string()];
+        assert_eq!(actionable_security(&sec, &upd).into_iter().collect::<Vec<_>>(), vec!["libssl3t64".to_string(), "openssh-sftp-server".to_string()]);
+    }
+
+    #[test]
+    fn listening_addresses() {
+        for (a, r) in [
+            ("0.0.0.0", Reach::Any),
+            ("*", Reach::Any),
+            ("[::]", Reach::Any),
+            ("127.0.0.53%lo", Reach::Loopback),
+            ("[::1]", Reach::Loopback),
+            ("*%lo", Reach::Loopback),
+            ("10.0.0.3", Reach::Private),
+            ("192.168.10.5%ens18", Reach::Private),
+            ("100.64.1.2", Reach::Private),
+            ("[fd00:1::1]", Reach::Private),
+            ("[fe80::1%eth0]", Reach::Private),
+            ("203.0.113.42", Reach::Public),
+            ("[2001:db8:1::1]", Reach::Public),
+        ] {
+            assert_eq!(reach(a), r, "{a}");
+        }
+    }
+
+    #[test]
+    fn services_from_the_listen_section() {
+        let listen = "S\ttcp\t0.0.0.0\t443\tnginx\t912\nS\ttcp\t0.0.0.0\t443\tnginx\t910\nS\ttcp\t[::]\t443\tnginx\t910\n\
+            S\ttcp\t127.0.0.1\t8080\tapp\t20\nS\ttcp\t10.0.0.3\t22\tsshd\t700\nS\tudp\t*\t53\tunbound\t30\n\
+            X\t910\t/usr/sbin/nginx (deleted)\nX\t700\t/usr/sbin/sshd\nX\t30\t/opt/unbound/sbin/unbound\n\
+            M\t910\t/usr/lib64/libssl.so.3.2.2\t-\nM\t910\t/usr/lib64/libc.so.6\t-\nM\t700\t/usr/lib64/libcrypto.so.3.5.8\tdeleted\nM\t700\t/usr/lib/x86_64-linux-gnu/libz.so.1\t-\n\
+            O\t/usr/sbin/nginx\tnginx\nO\t/usr/lib64/libssl.so.3.2.2\topenssl-libs\nO\t/usr/lib64/libc.so.6\tglibc\nO\t/usr/sbin/sshd\topenssh-server\nO\t/lib/x86_64-linux-gnu/libz.so.1\tzlib1g\n";
+        let pkgs = vec!["nginx\t2:1.26.3-1.el10\tx86_64".to_string(), "openssh-server\t0:9.9p1-27.el10_2\tx86_64".to_string(), "glibc\t0:2.39-58.el10\tx86_64".to_string()];
+        let v = services(listen, &versions(&pkgs));
+        let lines: Vec<String> = v.iter().map(Service::line).collect();
+        assert_eq!(
+            lines,
+            vec![
+                "tcp\t22\t10.0.0.3\tprivate\tsshd\t/usr/sbin/sshd\topenssh-server\t9.9p1-27.el10_2\tyes\tzlib1g".replace("tcp\t22", "tcp/22"),
+                "tcp/443\t0.0.0.0\tany\tnginx\t/usr/sbin/nginx\tnginx\t2:1.26.3-1.el10\tyes\tglibc,openssl-libs".to_string(),
+                "tcp/443\t[::]\tany\tnginx\t/usr/sbin/nginx\tnginx\t2:1.26.3-1.el10\tyes\tglibc,openssl-libs".to_string(),
+                "udp/53\t*\tany\tunbound\t/opt/unbound/sbin/unbound\t-\t-\tno\t-".to_string(),
+            ]
+        );
+        for l in &lines {
+            assert_eq!(Service::parse(l).unwrap().line(), *l);
+        }
+        let sshd = Service::parse(&lines[0]).unwrap();
+        assert!(!sshd.internet(true), "a private address on a host with a public one");
+        assert!(sshd.internet(false), "behind NAT, ports forwarded to it");
+        assert!(Service::parse(&lines[1]).unwrap().internet(true));
+    }
+
+    #[test]
+    fn internet_fixes_for_the_reload_services() {
+        let svc = |l: &str| Service::parse(l).unwrap();
+        let exposed = vec![
+            svc("tcp/22\t0.0.0.0\tany\tsshd\t/usr/sbin/sshd\topenssh-server\t9.9p1-12.el9_8\tno\tglibc,openssl-libs"),
+            svc("tcp/443\t0.0.0.0\tany\tnginx\t/usr/sbin/nginx\tnginx-core\t2:1.20.1-28.el9_8.6\tno\tglibc,openssl-libs,pcre"),
+            svc("tcp/3128\t*\tany\tsquid\t/usr/sbin/squid\tsquid\t7:5.5-26.el9_8\tyes\tglibc,openssl-libs"),
+        ];
+        let reload = vec!["nginx".to_string(), "sshd".to_string()];
+        let updates = vec!["openssl-libs.x86_64\t1:3.5.1-9.el9_8\tbaseos".to_string(), "squid.x86_64\t7:5.5-27.el9_8\tappstream".to_string()];
+        let set = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<BTreeSet<_>>();
+        // A library fix: both get it; squid is no reload service (tickets only).
+        let f = fix_of(&exposed, &set(&["openssl-libs", "squid"]), &updates, &reload).unwrap();
+        assert_eq!(f.packages, set(&["openssl-libs"]));
+        assert_eq!(f.services, set(&["nginx", "sshd"]));
+        assert_eq!(f.id, "openssl-libs 1:3.5.1-9.el9_8 | ");
+        // Nothing pending for them, nothing replaced: no fix.
+        assert_eq!(fix_of(&exposed, &set(&["squid"]), &updates, &reload), None);
+        assert_eq!(fix_of(&exposed, &set(&["openssl-libs"]), &updates, &[]), None);
+        // Replaced code alone: a reload, nothing to install.
+        let mut e2 = exposed;
+        e2[1].restart = true;
+        let f = fix_of(&e2, &set(&[]), &updates, &reload).unwrap();
+        assert!(f.packages.is_empty());
+        assert_eq!(f.services, set(&["nginx"]));
+        assert_eq!(f.id, " | nginx");
     }
 
     #[test]

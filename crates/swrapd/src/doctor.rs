@@ -1,8 +1,11 @@
-//! `swrap doctor [--scrub] [--rebuild]` (spec 12.6). Daily run (recent files) and weekly scrub
-//! (everything, including gzip members). Findings go to the audit log and the admin MOTD.
+//! `swrap doctor [--scrub] [--rebuild] | ack <file> <reason…> | acks` (spec 12.6). Daily run
+//! (recent files) and weekly scrub (everything, including gzip members). Findings go to the
+//! audit log and the admin MOTD. A recording an admin has looked at and accepted as it is
+//! (`ack`) is no finding while its records stay the same.
 
 use crate::daemon::{Caller, Console, Daemon};
-use anyhow::Result;
+use anyhow::{bail, Context, Result};
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -70,7 +73,8 @@ pub fn check(d: &Daemon, scrub: bool, rebuild: bool, con: &Console) -> Vec<Strin
         files(&base, &mut all);
     }
     let cutoff = SystemTime::now() - Duration::from_secs(86400);
-    let mut n = 0;
+    let acks = load_acks(d);
+    let (mut n, mut acked) = (0, 0);
     for p in all {
         let s = p.to_string_lossy();
         if !(s.ends_with(".swrec") || s.ends_with(".swrec.gz")) {
@@ -84,13 +88,22 @@ pub fn check(d: &Daemon, scrub: bool, rebuild: bool, con: &Console) -> Vec<Strin
             Ok(r) => {
                 n += 1;
                 if matches!(r.report.status, swrec::Status::Damaged | swrec::Status::Tampered) {
-                    f.push(format!("{}: {} {:?} {:?}", s, r.report.status.as_str(), r.report.damaged, r.report.notes));
+                    let finding = format!("{}: {} {:?} {:?}", s, r.report.status.as_str(), r.report.damaged, r.report.notes);
+                    match acks.ack.iter().find(|a| a.path == ack_key(&s)) {
+                        Some(a) if records_b3(&p).is_ok_and(|h| h == a.records_b3) => acked += 1,
+                        Some(a) => f.push(format!("{finding} (acknowledged {} by {}, but its records changed since)", a.at, a.by)),
+                        None => f.push(finding),
+                    }
                 }
             }
             Err(e) => f.push(format!("{s}: unreadable: {e}")),
         }
     }
-    con.out(format!("{n} record files verified{}", if scrub { " (scrub)" } else { " (modified in the last P1D)" }));
+    con.out(format!(
+        "{n} record files verified{}{}",
+        if scrub { " (scrub)" } else { " (modified in the last P1D)" },
+        if acked > 0 { format!(", {acked} with acknowledged findings (swrap doctor acks)") } else { String::new() }
+    ));
     // 5. stale runtime state (session dirs of dead workers)
     let live_ids: Vec<String> = crate::session::live_sessions(d).iter().filter_map(|j| j["id"].as_str().map(String::from)).collect();
     if let Ok(rd) = std::fs::read_dir(d.paths.sessions()) {
@@ -204,8 +217,110 @@ pub fn selinux_report(detail: bool) -> Vec<String> {
     v
 }
 
+// ---------------------------------------------------------------- acknowledged findings
+
+/// `config/doctor-ack.toml`: recordings accepted as they are, each pinned to its records.
+#[derive(Serialize, Deserialize, Default)]
+struct Acks {
+    #[serde(default)]
+    ack: Vec<Ack>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct Ack {
+    /// The recording's path without `.gz`: compressing it keeps the acknowledgment.
+    path: String,
+    /// blake3 of its records (the decompressed lines), as they were when acknowledged.
+    records_b3: String,
+    /// What the verifier said then.
+    finding: String,
+    reason: String,
+    by: String,
+    at: String,
+}
+
+fn acks_path(d: &Daemon) -> PathBuf {
+    d.paths.config().join("doctor-ack.toml")
+}
+
+fn load_acks(d: &Daemon) -> Acks {
+    std::fs::read_to_string(acks_path(d)).ok().and_then(|s| toml::from_str(&s).ok()).unwrap_or_default()
+}
+
+fn ack_key(p: &str) -> &str {
+    p.strip_suffix(".gz").unwrap_or(p)
+}
+
+/// Hash of a recording's records, the same for `.swrec` and the `.swrec.gz` made from it.
+fn records_b3(p: &Path) -> Result<String> {
+    let mut h = blake3::Hasher::new();
+    let rep = swrec::reader::for_each_raw_line(p, |l| {
+        h.update(l.bytes);
+        if l.complete {
+            h.update(b"\n");
+        }
+        true
+    })?;
+    if !rep.damage.is_empty() {
+        bail!("{}", rep.damage.join("; "));
+    }
+    Ok(h.finalize().to_hex().to_string())
+}
+
+/// `swrap doctor ack <file> <reason…>`: accept a recording with findings as it is.
+fn ack(d: &Daemon, c: &Caller, args: &[String]) -> Result<Resp> {
+    let [file, reason @ ..] = args else { bail!("usage: swrap doctor ack <recording> <reason…>") };
+    let reason = reason.join(" ");
+    if reason.trim().len() < 10 || reason.len() > 500 {
+        bail!("say why it is acceptable (10 to 500 characters)");
+    }
+    let p = std::fs::canonicalize(file).with_context(|| format!("{file}"))?;
+    let s = p.to_string_lossy().to_string();
+    if ![d.paths.rec(), d.paths.runs(), d.paths.logs(), d.paths.audit()].iter().any(|b| p.starts_with(b)) || !(s.ends_with(".swrec") || s.ends_with(".swrec.gz")) {
+        bail!("{s} is no recording of this node");
+    }
+    let r = swrec::scan(&p, swrec::ScanOpts { verifier: Some(&swrec::RecVerifier::for_core(&d.paths)), keep_records: false, live: false })?;
+    if !matches!(r.report.status, swrec::Status::Damaged | swrec::Status::Tampered) {
+        bail!("{s} verifies as {}: nothing to acknowledge", r.report.status.as_str());
+    }
+    let a = Ack {
+        path: ack_key(&s).to_string(),
+        records_b3: records_b3(&p)?,
+        finding: format!("{} {:?} {:?}", r.report.status.as_str(), r.report.damaged, r.report.notes),
+        reason,
+        by: c.name.clone(),
+        at: swrap_core::time::fmt_utc_secs(swrap_core::time::now()),
+    };
+    let _g = d.config_lock.lock().unwrap();
+    let mut acks = load_acks(d);
+    acks.ack.retain(|x| x.path != a.path);
+    acks.ack.push(a.clone());
+    acks.ack.sort_by(|x, y| x.path.cmp(&y.path));
+    swrap_core::atomic::write(&acks_path(d), toml::to_string_pretty(&acks)?.as_bytes(), 0o640, d.owner())?;
+    d.commit(&format!("doctor: acknowledged {} ({})", a.path, c.name))?;
+    d.audit_event(&c.name, "doctor.ack", &a.path, "", "ok", json!({"finding": a.finding, "reason": a.reason, "records_b3": a.records_b3}), "");
+    Ok(Resp::text(format!("acknowledged {s}: {}\nThe doctor reports it again if its records change.\n", a.finding)))
+}
+
+fn list_acks(d: &Daemon) -> Resp {
+    let acks = load_acks(d);
+    if acks.ack.is_empty() {
+        return Resp::text("no acknowledged findings\n");
+    }
+    let mut t = String::new();
+    for a in &acks.ack {
+        t += &format!("{}\n  {} · acknowledged {} by {}: {}\n", a.path, a.finding, a.at, a.by, a.reason);
+    }
+    Resp::text(t)
+}
+
 pub fn run(d: &Arc<Daemon>, c: &Caller, args: &[String], con: &Console) -> Result<Resp> {
     c.require_admin()?;
+    match args.first().map(String::as_str) {
+        Some("ack") => return ack(d, c, &args[1..]),
+        Some("acks") => return Ok(list_acks(d)),
+        _ => {}
+    }
     if args.iter().any(|a| a == "--selinux") {
         return Ok(Resp::text(selinux_report(true).join("\n") + "\n"));
     }
@@ -228,7 +343,7 @@ fn record(d: &Daemon, findings: &[String], scrub: bool) {
     d.audit_event("", if scrub { "doctor.scrub" } else { "doctor.run" }, "core", "", if findings.is_empty() { "ok" } else { "findings" }, json!({"findings": findings}), "");
     let serious: Vec<&String> = findings.iter().filter(|x| !x.starts_with("removed stale") && !x.starts_with("derived")).collect();
     if !serious.is_empty() {
-        crate::motd::alert(d, "doctor", json!({"findings": serious.len(), "first": serious[0]}));
+        crate::motd::alert(d, "doctor", json!({"findings": serious.len(), "first": serious[0], "all": serious.iter().take(20).collect::<Vec<_>>()}));
     }
 }
 
@@ -256,5 +371,30 @@ pub async fn run_loop(d: Arc<Daemon>) {
         let new = json!({"run": now, "scrub": if scrub { now } else { last_scrub }});
         let _ = std::fs::create_dir_all(d.paths.index());
         let _ = std::fs::write(&state_p, new.to_string());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn acknowledgments_survive_compression() {
+        let dir = std::env::temp_dir().join(format!("swrap-doctor-ack-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let plain = dir.join("x.swrec");
+        let body: String = (0..5000).map(|i| format!("deadbeef {{\"k\":\"o\",\"s\":{i}}}\n")).collect();
+        std::fs::write(&plain, &body).unwrap();
+        let h = records_b3(&plain).unwrap();
+        assert_eq!(h, blake3::hash(body.as_bytes()).to_hex().to_string());
+        let gz = swrec::compress::compress_file(&plain, 16 << 10, None).unwrap();
+        assert!(gz.to_string_lossy().ends_with(".swrec.gz"));
+        assert_eq!(records_b3(&gz).unwrap(), h, "same records, several gzip members");
+        assert_eq!(ack_key(&gz.to_string_lossy()), plain.to_string_lossy());
+        // One more line: no longer what was acknowledged.
+        std::fs::write(&plain, format!("{body}x\n")).unwrap();
+        assert_ne!(records_b3(&plain).unwrap(), h);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -202,7 +202,9 @@
         } else if (it.type === "error") {
           d = el("div", "item err"); d.append(head(it, "✗ inference error" + (it.status && it.status !== 200 ? " (HTTP " + it.status + ")" : "") + (it.cancelled ? " (cancelled)" : "")), el("div", "txt", it.error || ""));
         } else if (it.type === "helper") {
-          d = el("div", "item dim"); d.append(head(it, `helper request #${it.n} (${it.model || "model"}: title, compaction…)`), usageLine(it.usage || {}, it));
+          d = el("div", "item dim"); d.append(head(it, `request #${it.n} without tools (${it.model || "model"}: title, compaction…, or swrap's tools not connected yet)`));
+          if (it.text) d.append(det("reply", pre(it.text), "ctx"));
+          d.append(usageLine(it.usage || {}, it));
         } else {
           d = el("div", "item dim"); d.append(head(it, "note"), el("div", "txt", it.msg || ""));
         }

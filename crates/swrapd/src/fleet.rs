@@ -111,7 +111,7 @@ where
     rows
 }
 
-fn valid_pkg(p: &str) -> bool {
+pub fn valid_pkg(p: &str) -> bool {
     !p.is_empty() && p.len() <= 200 && p.bytes().all(|b| b.is_ascii_alphanumeric() || b"._+-:".contains(&b)) && !p.starts_with('-')
 }
 
@@ -144,10 +144,34 @@ pub fn update(d: &Arc<Daemon>, c: &Caller, targets: &str, app: Option<&str>, con
             Job { host: (*h).clone(), ruser, sudo }
         })
         .collect();
+    run_update(d, &c.name, targets, jobs, app, json!({"origin": c.origin.as_str()}), con)
+}
+
+/// `update` of a swai session: one host, as the root-capable account its AI grant gives
+/// (`sudo` = via swrap-managed NOPASSWD sudo). Recorded as a swupdate run like any other.
+#[allow(clippy::too_many_arguments)]
+pub fn update_for_ai(d: &Arc<Daemon>, who: &str, host: &Host, ruser: &str, sudo: bool, app: Option<&str>, session: &str, con: &Console) -> Result<Resp> {
+    if d.is_sealed() {
+        bail!("the swrap vault is sealed; fleet jobs are unavailable until an admin logs in");
+    }
+    if let Some(p) = app {
+        if !valid_pkg(p) {
+            bail!("package: one package name (letters, digits and ._+-:), got {p:?}");
+        }
+    }
+    let jobs = vec![Job { host: host.clone(), ruser: ruser.to_string(), sudo }];
+    run_update(d, who, &host.label, jobs, app, json!({"origin": "core", "swai": session}), con)
+}
+
+fn run_update(d: &Arc<Daemon>, who: &str, targets: &str, jobs: Vec<Job>, app: Option<&str>, extra: Value, con: &Console) -> Result<Resp> {
     let labels: Vec<String> = jobs.iter().map(|j| j.host.label.clone()).collect();
     let reinventory: Vec<(Host, String)> = jobs.iter().map(|j| (j.host.clone(), j.ruser.clone())).collect();
-    let run = Run::new(d, "swupdate", &c.name, targets, json!({"app": app, "hosts": labels, "origin": c.origin.as_str()}))?;
-    d.audit_event(&c.name, "fleet.update", targets, "", "start", json!({"run": run.id, "app": app, "hosts": labels}), &run.id);
+    let mut meta = json!({"app": app, "hosts": labels});
+    if let (Some(m), Some(x)) = (meta.as_object_mut(), extra.as_object()) {
+        m.extend(x.clone());
+    }
+    let run = Run::new(d, "swupdate", who, targets, meta)?;
+    d.audit_event(who, "fleet.update", targets, "", "start", json!({"run": run.id, "app": app, "hosts": labels, "swai": extra["swai"]}), &run.id);
     let width = labels.iter().map(|l| l.len()).max().unwrap_or(4);
     con.err(format!(
         "swupdate {}: {} on {} ({}), recorded as run {}",
@@ -160,7 +184,7 @@ pub fn update(d: &Arc<Daemon>, c: &Caller, targets: &str, app: Option<&str>, con
 
     let signer = Arc::new(swrec::RecSigner::load(&d.paths.recsign().join("ed25519.key"), "core").context("load recording signing key")?);
     let run = Arc::new(run);
-    let (d2, run2, con2, app2, who2, sg2) = (d.clone(), run.clone(), con.clone(), app.map(str::to_string), c.name.clone(), signer.clone());
+    let (d2, run2, con2, app2, who2, sg2) = (d.clone(), run.clone(), con.clone(), app.map(str::to_string), who.to_string(), signer.clone());
     let con3 = con.clone();
     let mut out = parallel(
         d,
@@ -189,14 +213,14 @@ pub fn update(d: &Arc<Daemon>, c: &Caller, targets: &str, app: Option<&str>, con
         .map(|(host, ruser)| crate::inventory::Target { host, ruser })
         .collect();
     if !changed.is_empty() {
-        match crate::inventory::collect(d, &c.name, targets, changed, None) {
+        match crate::inventory::collect(d, who, targets, changed, None) {
             Ok(r) => text += &format!("inventory refreshed ({})\n", r.data["run"].as_str().unwrap_or("")),
             Err(e) => text += &format!("inventory refresh failed: {e:#}\n"),
         }
     }
     text += &format!("run {} · {} ok, {} failed, {} skipped\n", run.id, out.iter().filter(|o| o.result == "ok").count(), failed, out.iter().filter(|o| matches!(o.result.as_str(), "not-installed" | "unsupported")).count());
     let rows: Vec<Value> = out.iter().map(|o| json!({"label": o.label, "ruser": o.ruser, "result": o.result, "changed": o.changed, "needs_reboot": o.reboot, "duration": o.duration, "exit": o.code, "detail": o.detail})).collect();
-    d.audit_event(&c.name, "fleet.update", targets, "", if failed == 0 { "ok" } else { "failed" }, json!({"run": run.id, "app": app, "hosts": rows}), &run.id);
+    d.audit_event(who, "fleet.update", targets, "", if failed == 0 { "ok" } else { "failed" }, json!({"run": run.id, "app": app, "hosts": rows}), &run.id);
     let mut r = Resp::ok(json!({"run": run.id, "hosts": rows}));
     r.text = text;
     r.exit = if failed == 0 { 0 } else { 1 };
@@ -403,10 +427,12 @@ impl Lines {
 struct RunJob {
     host: Host,
     ruser: String,
+    /// The account is not root: run as root through sudo -n (swrap-managed NOPASSWD).
+    sudo: bool,
 }
 
 #[derive(Default)]
-struct RunOut {
+pub struct RunOut {
     label: String,
     ruser: String,
     result: String,
@@ -463,7 +489,7 @@ pub fn run(d: &Arc<Daemon>, c: &Caller, targets: &str, ruser: Option<&str>, scri
     if picked.is_empty() {
         bail!("no host in {targets:?} you may use{}", ruser.map(|r| format!(" as {r}")).unwrap_or_default());
     }
-    let jobs: Vec<RunJob> = picked.iter().map(|h| RunJob { host: (*h).clone(), ruser: account(h).expect("filtered above") }).collect();
+    let jobs: Vec<RunJob> = picked.iter().map(|h| RunJob { host: (*h).clone(), ruser: account(h).expect("filtered above"), sudo: false }).collect();
     let labels: Vec<String> = jobs.iter().map(|j| j.host.label.clone()).collect();
     let names: Vec<String> = secrets.iter().map(|s| s.name.clone()).collect();
     // What is shown and kept: never a secret value, even if one was typed into the command.
@@ -492,23 +518,39 @@ pub fn run(d: &Arc<Daemon>, c: &Caller, targets: &str, ruser: Option<&str>, scri
         args.iter().map(|a| format!(" {}", crate::ai::q(a))).collect::<String>()
     );
     let timeout = d.cfg().fleet.default_timeout.exact().unwrap_or(Duration::from_secs(600));
+    let run_id = run.id.clone();
+    let out = run_all(d, &c.name, run, jobs, cmd, stdin, secrets.to_vec(), shown, timeout, width, con)?;
+    let (text, rows, failed) = summary(&run_id, &out, width);
+    d.audit_event(&c.name, "fleet.run", targets, ruser.unwrap_or(""), if failed == 0 { "ok" } else { "failed" }, json!({"run": run_id, "kind": kind, "hosts": rows}), &run_id);
+    let mut r = Resp::ok(json!({"run": run_id, "hosts": rows}));
+    r.text = text;
+    r.exit = if failed == 0 { 0 } else { 1 };
+    Ok(r)
+}
+
+/// `cmd` on every job's host on up to `[fleet] parallel` threads, live `label | line` output.
+#[allow(clippy::too_many_arguments)]
+fn run_all(d: &Arc<Daemon>, who: &str, run: Run, jobs: Vec<RunJob>, cmd: String, stdin: Vec<u8>, secrets: Vec<SecretEnv>, shown: String, timeout: Duration, width: usize, con: &Console) -> Result<Vec<RunOut>> {
     let signer = Arc::new(swrec::RecSigner::load(&d.paths.recsign().join("ed25519.key"), "core").context("load recording signing key")?);
-    let (d2, run2, con2, who2, sg2) = (d.clone(), Arc::new(run), con.clone(), c.name.clone(), signer);
-    let run_id = run2.id.clone();
-    let (secrets2, cmd2, stdin2, shown2) = (secrets.to_vec(), cmd, stdin, shown.clone());
+    let (d2, run2, con2, who2) = (d.clone(), Arc::new(run), con.clone(), who.to_string());
     let con3 = con.clone();
     let mut out = parallel(
         d,
         jobs,
-        move |job: &RunJob| run_host(&d2, &who2, &run2, job, &cmd2, &stdin2, &secrets2, &shown2, timeout, &con2, width, &sg2),
+        move |job: &RunJob| run_host(&d2, &who2, &run2, job, &cmd, &stdin, &secrets, &shown, timeout, &con2, width, &signer),
         move |job: &RunJob, why: String| {
             con3.out(format!("{:<width$} | swrap: {why}", job.host.label));
             RunOut { label: job.host.label.clone(), ruser: job.ruser.clone(), result: "error".into(), code: -1, detail: why, ..Default::default() }
         },
     );
     out.sort_by(|a, b| a.label.cmp(&b.label));
+    Ok(out)
+}
+
+/// The summary table of a run, its rows for the audit and the response, and how many failed.
+fn summary(run_id: &str, out: &[RunOut], width: usize) -> (String, Vec<Value>, usize) {
     let mut text = format!("\n{:<width$}  {:<10}  {:<12}  {:>5}  {:<14}  {}\n", "HOST", "ACCOUNT", "RESULT", "EXIT", "DURATION", "REDACTED");
-    for o in &out {
+    for o in out {
         text += &format!("{:<width$}  {:<10}  {:<12}  {:>5}  {:<14}  {}\n", o.label, o.ruser, o.result, o.code, o.duration, o.redacted);
     }
     for o in out.iter().filter(|o| !o.detail.is_empty()) {
@@ -517,7 +559,31 @@ pub fn run(d: &Arc<Daemon>, c: &Caller, targets: &str, ruser: Option<&str>, scri
     let failed = out.iter().filter(|o| o.result != "ok").count();
     text += &format!("run {run_id} · {} ok, {failed} failed\n", out.len() - failed);
     let rows: Vec<Value> = out.iter().map(|o| json!({"label": o.label, "ruser": o.ruser, "result": o.result, "exit": o.code, "duration": o.duration, "redacted": o.redacted, "detail": o.detail})).collect();
-    d.audit_event(&c.name, "fleet.run", targets, ruser.unwrap_or(""), if failed == 0 { "ok" } else { "failed" }, json!({"run": run_id, "kind": kind, "hosts": rows}), &run_id);
+    (text, rows, failed)
+}
+
+/// A root job on several hosts as one run of `kind` (`swreload`): `jobs` are (host, account,
+/// via sudo -n), `script` goes through the `swr` wrapper. Audited as `action`; the response
+/// carries the summary and a row per host.
+#[allow(clippy::too_many_arguments)]
+pub fn root_run(d: &Arc<Daemon>, who: &str, kind: &str, action: &str, targets: &str, jobs: Vec<(Host, String, bool)>, shown: &str, script: &[u8], timeout: Duration, extra: Value, con: &Console) -> Result<Resp> {
+    let labels: Vec<String> = jobs.iter().map(|j| j.0.label.clone()).collect();
+    let b3 = blake3::hash(script).to_hex().to_string();
+    let mut meta = json!({"script": shown, "script_b3": b3, "hosts": labels});
+    if let (Some(m), Some(x)) = (meta.as_object_mut(), extra.as_object()) {
+        m.extend(x.clone());
+    }
+    let run = Run::new(d, kind, who, targets, meta)?;
+    swrap_core::atomic::write(&run.dir.join("script"), script, 0o640, swrap_core::atomic::Owner::new(d.swrap_uid, d.admin_gid))?;
+    d.audit_event(who, action, targets, "", "start", json!({"run": run.id, "hosts": labels, "extra": extra}), &run.id);
+    let width = labels.iter().map(|l| l.len()).max().unwrap_or(4);
+    con.err(format!("{shown} on {} ({} host{}), recorded as run {}", labels.join(", "), labels.len(), if labels.len() == 1 { "" } else { "s" }, run.id));
+    let cmd = format!("bash -c {} {kind} 0 {}", crate::ai::q(RUN_WRAPPER), script.len());
+    let jobs: Vec<RunJob> = jobs.into_iter().map(|(host, ruser, sudo)| RunJob { host, ruser, sudo }).collect();
+    let run_id = run.id.clone();
+    let out = run_all(d, who, run, jobs, cmd, script.to_vec(), vec![], shown.to_string(), timeout, width, con)?;
+    let (text, rows, failed) = summary(&run_id, &out, width);
+    d.audit_event(who, action, targets, "", if failed == 0 { "ok" } else { "failed" }, json!({"run": run_id, "hosts": rows}), &run_id);
     let mut r = Resp::ok(json!({"run": run_id, "hosts": rows}));
     r.text = text;
     r.exit = if failed == 0 { 0 } else { 1 };
@@ -541,10 +607,9 @@ pub fn system_job(d: &Arc<Daemon>, who: &str, kind: &str, host: &Host, ruser: &s
     }
     let env_len = stdin.len();
     stdin.extend_from_slice(script);
-    let sudo = if ruser == "root" { "" } else { "sudo -n " };
-    let cmd = format!("{sudo}bash -c {} {kind} {env_len} {}", crate::ai::q(RUN_WRAPPER), script.len());
+    let cmd = format!("bash -c {} {kind} {env_len} {}", crate::ai::q(RUN_WRAPPER), script.len());
     let signer = swrec::RecSigner::load(&d.paths.recsign().join("ed25519.key"), "core").context("load recording signing key")?;
-    let job = RunJob { host: host.clone(), ruser: ruser.to_string() };
+    let job = RunJob { host: host.clone(), ruser: ruser.to_string(), sudo: ruser != "root" };
     let o = run_host(d, who, &run, &job, &cmd, &stdin, redact, shown, timeout, con, host.label.len(), &signer)?;
     Ok((run.id, o.code, o.result, o.detail))
 }
@@ -556,6 +621,14 @@ fn run_host(d: &Arc<Daemon>, who: &str, run: &Run, job: &RunJob, cmd: &str, stdi
     let profile = Profile::load(&d.paths, &h.profile)?;
     let known = std::fs::read_to_string(d.paths.known_hosts(&h.label)).context("host keys not pinned")?;
     let mut rec = run.host_writer(d, h, &job.ruser, who, shown)?;
+    let sudo_cmd;
+    let cmd = if job.sudo {
+        rec.note(&format!("{} is not root: the job runs via sudo -n (swrap-managed NOPASSWD)", job.ruser))?;
+        sudo_cmd = format!("sudo -n {cmd}");
+        sudo_cmd.as_str()
+    } else {
+        cmd
+    };
     if !secrets.is_empty() {
         rec.note(&format!("secret env: {} (values never recorded)", secrets.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join(" ")))?;
     }

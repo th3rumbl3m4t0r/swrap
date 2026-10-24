@@ -5,19 +5,56 @@
 
 use crate::daemon::{Console, Daemon};
 use anyhow::{bail, Context, Result};
+use jiff::Timestamp;
 use serde_json::{json, Value};
 use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use swrap_core::api::{EdgePty, EdgeReq, Req, Resp};
 use swrap_core::frame::{aio, kind, Frame};
 use swrap_core::paths::safe_component;
+use swrap_core::time::fmt_utc_secs;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc;
 
 static INFLIGHT: AtomicUsize = AtomicUsize::new(0);
 const MAX_INFLIGHT: usize = 64;
+
+/// Hellos (every PT30S) in a row that showed the edge clock more than PT1S off.
+struct ClockOff {
+    since: Timestamp,
+    last: Timestamp,
+    max_ms: i64,
+    alerted: bool,
+}
+static CLOCK: Mutex<Option<ClockOff>> = Mutex::new(None);
+const CLOCK_MAX_MS: i64 = 1000;
+/// How long every Hello must be off before it is the clock, not a Hello that arrived late (a core
+/// busy just after boot, a congested link): one is, and the next one PT30S later is on time.
+const CLOCK_FOR_SECS: i64 = 300;
+/// A longer silence (link down) starts the count again.
+const CLOCK_GAP_SECS: i64 = 120;
+
+/// The alert for a Hello at `t` whose time was `off_ms` (edge minus core) off: once, when every
+/// Hello for PT5M was more than PT1S off; a Hello within PT1S ends it.
+fn clock_check(st: &mut Option<ClockOff>, t: Timestamp, off_ms: Option<i64>) -> Option<Value> {
+    let Some(off) = off_ms.filter(|o| o.abs() > CLOCK_MAX_MS) else {
+        *st = None;
+        return None;
+    };
+    if st.as_ref().is_some_and(|c| t.as_second() - c.last.as_second() > CLOCK_GAP_SECS) {
+        *st = None;
+    }
+    let c = st.get_or_insert(ClockOff { since: t, last: t, max_ms: 0, alerted: false });
+    c.last = t;
+    c.max_ms = c.max_ms.max(off.abs());
+    if c.alerted || t.as_second() - c.since.as_second() < CLOCK_FOR_SECS {
+        return None;
+    }
+    c.alerted = true;
+    Some(json!({"msg": "edge clock offset above PT1S", "offset_ms": off.abs(), "max_offset_ms": c.max_ms, "since": fmt_utc_secs(c.since), "edge": if off > 0 { "ahead of core" } else { "behind core" }, "check": "chronyc tracking on the core and on edge"}))
+}
 
 pub fn link_state_path(d: &Daemon) -> std::path::PathBuf {
     d.paths.run.join("link.json")
@@ -81,12 +118,15 @@ async fn handle_api(d: Arc<Daemon>, mut s: UnixStream) -> Result<()> {
         EdgeReq::Hello { node, version, now, addrs } => {
             let edge_t = swrap_core::time::parse_datetime(&now).ok();
             let core_t = swrap_core::time::now();
-            let offset_ms = edge_t.map(|t| (t.as_millisecond() - core_t.as_millisecond()).abs()).unwrap_or(0);
+            // Edge minus core, and also the time this Hello took to arrive: a late one looks like an edge clock behind.
+            let off_ms = edge_t.map(|t| t.as_millisecond() - core_t.as_millisecond());
+            let offset_ms = off_ms.map(i64::abs).unwrap_or(0);
             let addrs: Vec<String> = addrs.into_iter().filter(|a| a.parse::<std::net::IpAddr>().is_ok()).take(32).collect();
             let st = json!({"up_since": swrap_core::time::fmt_utc_secs(core_t), "edge_node": node, "edge_version": version, "clock_offset_ms": offset_ms, "edge_addrs": addrs});
             let _ = std::fs::write(link_state_path(&d), st.to_string());
-            if offset_ms > 1000 {
-                crate::motd::alert(&d, "clock", json!({"msg": "edge clock offset above PT1S", "offset_ms": offset_ms}));
+            let alert = clock_check(&mut CLOCK.lock().unwrap_or_else(|p| p.into_inner()), core_t, off_ms);
+            if let Some(detail) = alert {
+                crate::motd::alert(&d, "clock", detail);
             }
             resp(&mut s, &Resp::ok(json!({"now": swrap_core::time::fmt_utc(core_t)}))).await
         }
@@ -364,4 +404,48 @@ fn edge_log(d: &Daemon, lines: &[String]) -> Result<()> {
     }
     w.sync()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn at(s: i64) -> Timestamp {
+        Timestamp::from_second(1_791_000_000 + s).unwrap()
+    }
+
+    #[test]
+    fn one_late_hello_is_not_the_clock() {
+        let mut st = None;
+        // 2026-10-11T07:41:05Z: the first Hello after a boot, then on time again.
+        assert!(clock_check(&mut st, at(0), Some(-13_068)).is_none());
+        assert!(clock_check(&mut st, at(30), Some(-27)).is_none());
+        assert!(st.is_none());
+        assert!(clock_check(&mut st, at(60), None).is_none());
+    }
+
+    #[test]
+    fn a_clock_off_for_five_minutes_alerts_once() {
+        let mut st = None;
+        let alerts: Vec<(i64, Value)> = (0..=20).filter_map(|i| clock_check(&mut st, at(30 * i), Some(2_500 + i)).map(|a| (i, a))).collect();
+        assert_eq!(alerts.len(), 1);
+        let (i, a) = &alerts[0];
+        assert_eq!(*i, 10);
+        assert_eq!(a["since"], fmt_utc_secs(at(0)));
+        assert_eq!(a["max_offset_ms"], 2_510);
+        assert_eq!(a["edge"], "ahead of core");
+        // Back within PT1S, then off again: a new count.
+        assert!(clock_check(&mut st, at(660), Some(400)).is_none());
+        assert!((0..10).all(|i| clock_check(&mut st, at(690 + 30 * i), Some(-1_500)).is_none()));
+        assert_eq!(clock_check(&mut st, at(990), Some(-1_500)).unwrap()["edge"], "behind core");
+    }
+
+    #[test]
+    fn a_link_outage_starts_the_count_again() {
+        let mut st = None;
+        assert!(clock_check(&mut st, at(0), Some(-9_000)).is_none());
+        // The link was down for an hour: the next late Hello is a new count, not PT1H of it.
+        assert!(clock_check(&mut st, at(3_600), Some(-9_000)).is_none());
+        assert!(clock_check(&mut st, at(3_630), Some(-200)).is_none());
+    }
 }

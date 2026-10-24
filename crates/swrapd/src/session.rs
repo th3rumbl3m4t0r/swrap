@@ -185,13 +185,23 @@ pub fn plan_sw(d: &Arc<Daemon>, c: &Caller, req: &Req, origin: Node, delegated: 
     let nonce = crate::util::random_hex(16);
     let sdir = new_session_dir(d, &id)?;
     let ssh_config = profile.ssh_config();
+    // A host reached `via` another: the jump leg (its key in the same agent, its pinned keys).
+    let jump = crate::hosts::Jump::of(d, &host)?;
+    let known_all = match &jump {
+        Some(j) => format!("{known}{}", j.known),
+        None => known.clone(),
+    };
     write_owned(d, &sdir.join("ssh_config"), ssh_config.as_bytes(), 0o600)?;
     // known_hosts keyed by label (used with HostKeyAlias) so address changes can't bypass pinning.
-    write_owned(d, &sdir.join("known_hosts"), known.as_bytes(), 0o600)?;
+    write_owned(d, &sdir.join("known_hosts"), known_all.as_bytes(), 0o600)?;
     write_owned(d, &sdir.join("id.pub"), pub_line.as_bytes(), 0o600)?;
+    for (n, c) in jump.as_ref().map(|j| j.files()).unwrap_or_default() {
+        write_owned(d, &sdir.join(n), c.as_bytes(), 0o600)?;
+    }
 
     let private = d.with_dek(|dek| swrap_vault::Vault::new(&d.paths, d.owner()).get(dek, &enc))?;
-    let sa = SessionAgent::start(
+    let jump_key = jump.as_ref().map(|j| j.private(d)).transpose()?;
+    let sa = SessionAgent::start_with_jump(
         d.clone(),
         Policy {
             session_id: id.clone(),
@@ -203,13 +213,18 @@ pub fn plan_sw(d: &Arc<Daemon>, c: &Caller, req: &Req, origin: Node, delegated: 
             max_sigs: cfg.signing.max_signatures_per_session,
             window: cfg.signing.window.exact().unwrap_or(Duration::from_secs(120)),
             require_hostbound: cfg.signing.require_hostbound,
+            jump: jump.as_ref().map(|j| j.hop()),
         },
         private,
+        jump_key,
         &sdir,
     )?;
 
     let ssh_bin = profile.ssh_bin_for(exec.as_str()).to_string();
     let mut argv = ssh_argv(&ssh_bin, &sdir, label);
+    if let Some(j) = &jump {
+        argv.extend(j.proxy_args("core", &sdir.to_string_lossy(), None));
+    }
     argv.extend(["-o".into(), format!("SetEnv=SWRAP_SESSION={id}:{nonce}"), "-p".into(), host.port.to_string()]);
     argv.push("-tt".into());
     argv.push(format!("{ruser}@{}", host.address));
@@ -244,6 +259,7 @@ pub fn plan_sw(d: &Arc<Daemon>, c: &Caller, req: &Req, origin: Node, delegated: 
         ("hostkey_fp", json!(hostkey_fp)),
         ("hostbound", json!(ssh_supports_bind(&caps.version))),
         ("cmd", json!(cmd.join(" "))),
+        ("via", json!(host.via)),
         ("record_input", json!(true)),
         ("tty", json!(tty)),
     ] {
@@ -255,6 +271,7 @@ pub fn plan_sw(d: &Arc<Daemon>, c: &Caller, req: &Req, origin: Node, delegated: 
         (_, Node::Edge) => "edge",
         _ => "core",
     };
+    let via = if host.via.is_empty() { via.to_string() } else { format!("{via} and {}", host.via) };
     let mut banner = format!(
         "swrap: recording {} {}@{} via {} {} (keystrokes recorded)",
         id, ruser, label, via, fmt_display(t, cfg.tz(), false)
@@ -267,7 +284,11 @@ pub fn plan_sw(d: &Arc<Daemon>, c: &Caller, req: &Req, origin: Node, delegated: 
     }
     if exec == Node::Edge {
         // Edge runs ssh; hand back the plan. The agent stays on core behind the proxy.
-        let mut tail: Vec<String> = vec!["-o".into(), format!("HostKeyAlias={label}"), "-o".into(), format!("SetEnv=SWRAP_SESSION={id}:{nonce}"), "-p".into(), host.port.to_string(), "-tt".into(), format!("{ruser}@{}", host.address)];
+        let mut tail: Vec<String> = vec!["-o".into(), format!("HostKeyAlias={label}")];
+        if let Some(j) = &jump {
+            tail.extend(j.proxy_args("edge", crate::hosts::SDIR, None));
+        }
+        tail.extend(["-o".into(), format!("SetEnv=SWRAP_SESSION={id}:{nonce}"), "-p".into(), host.port.to_string(), "-tt".into(), format!("{ruser}@{}", host.address)]);
         if !cmd.is_empty() {
             tail.push("--".into());
             tail.extend(cmd.iter().cloned());
@@ -282,7 +303,8 @@ pub fn plan_sw(d: &Arc<Daemon>, c: &Caller, req: &Req, origin: Node, delegated: 
             header,
             argv_tail: tail,
             ssh_config,
-            known_hosts: known,
+            extra_files: jump.as_ref().map(|j| j.files()).unwrap_or_default(),
+            known_hosts: known_all,
             pub_key: pub_line,
             label: label.to_string(),
             ssh_bin,

@@ -304,8 +304,11 @@ pub fn chat(records: &[Map<String, Value>]) -> Value {
                     add(&mut tot, f, u[f].as_u64().unwrap_or(0));
                 }
                 if aux.contains(&n) {
+                    // Requests without tools: the harness's own helpers, or a turn that went out
+                    // before swrap's tools were connected. Their reply stays visible (folded).
                     add(&mut tot, "helper_requests", 1);
-                    items.push(json!({"type": "helper", "ts": ts, "t": rel(&ts), "n": n, "model": s("model"), "usage": u, "latency": s("latency")}));
+                    let (text, _, _, _) = msgs.get(&s("h")).map(|(_, c)| blocks(c)).unwrap_or_default();
+                    items.push(json!({"type": "helper", "ts": ts, "t": rel(&ts), "n": n, "model": s("model"), "usage": u, "latency": s("latency"), "text": cap(&text.join("\n\n"), 16 << 10).0}));
                     continue;
                 }
                 add(&mut tot, "requests", 1);

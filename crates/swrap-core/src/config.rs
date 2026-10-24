@@ -409,6 +409,14 @@ pub struct Host {
     /// swai may act on this host (spec 24.5: the host must opt in; default false).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub ai_allowed: bool,
+    /// Reached through another enrolled host's sshd (a jump: `ssh -W`), e.g. a host whose
+    /// firewall admits only that one. ssh runs where the via host is reached from.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub via: String,
+    /// The addresses this host sees swrap's connections come from (the via host's egress):
+    /// its keys' `from=`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub via_from: Vec<String>,
     /// `swai reset` may roll this VM back to its Proxmox snapshot (spec 24.5).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub ai_reset: bool,
@@ -646,6 +654,26 @@ pub struct AiBackend {
     /// Requests to this backend at once, over all sessions (0 = no limit); more wait their turn.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub max_concurrent: u32,
+    /// Context window the harness is told (0 = asked from the server). For servers that do not
+    /// report it, or where asking would load the model.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub context: u64,
+    /// Output tokens per request (0 = derived from the context).
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub max_output: u64,
+    /// The server's JSON status (no auth), shown with the backend; `"state": "on_battery"` (or
+    /// `ups.on_battery`) means paused.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub status_url: String,
+    /// The server answers 503/429 with Retry-After while it is paused (UPS on battery, queue
+    /// full): the proxy waits and sends the request again, within the backend timeout.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub wait_unavailable: bool,
+    /// swrap renders the prompt (`/apply-template`) and parses the model's raw output itself
+    /// (`/completion`, llama.cpp): tool-call markup inside the reasoning stays text instead of
+    /// becoming a call (Qwen3 XML or Hermes JSON tool calls).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub raw_tools: bool,
     #[serde(default)]
     pub added_by: String,
     #[serde(default)]
@@ -653,6 +681,7 @@ pub struct AiBackend {
 }
 fn ai_timeout() -> String { "PT1H".into() }
 fn is_zero_u32(n: &u32) -> bool { *n == 0 }
+fn is_zero_u64(n: &u64) -> bool { *n == 0 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
